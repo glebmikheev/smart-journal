@@ -1,0 +1,23 @@
+[blob_store]
+backend = "in_memory"
+
+[meta_store]
+backend = "in_memory"
+
+[vector_index]
+backend = "in_memory"
+
+[job_queue]
+backend = "in_process"
+
+[extractor]
+backend = "plain_text"
+
+[embedding_provider]
+backend = "mock_text"
+dim = 8
+normalize = true
+
+[llm_provider]
+backend = "mock_chat"
+
