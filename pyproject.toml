@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "smart-journal"
+version = "0.1.0"
+description = "Smart Journal increment 0 scaffold."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+  "mypy==1.18.2",
+  "ruff==0.12.0",
+]
+
+[project.scripts]
+smart-journal = "smart_journal.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+pretty = true
+packages = ["smart_journal"]
+
