@@ -65,9 +65,46 @@ class BlobStore(ProviderInfo, Protocol):
 class MetaStore(ProviderInfo, Protocol):
     def begin_transaction(self) -> None: ...
 
-    def create_node(self, graph_id: str, title: str) -> str: ...
+    def create_graph(self, title: str) -> str: ...
 
-    def get_node(self, node_id: str) -> Mapping[str, Any] | None: ...
+    def get_graph(
+        self, graph_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None: ...
+
+    def create_node(self, graph_id: str, title: str, body: str = "") -> str: ...
+
+    def update_node(
+        self, node_id: str, *, title: str | None = None, body: str | None = None
+    ) -> None: ...
+
+    def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None: ...
+
+    def list_nodes(
+        self, graph_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]: ...
+
+    def get_node(
+        self, node_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_revisions(self, node_id: str) -> list[Mapping[str, Any]]: ...
+
+    def attach_content_item(
+        self,
+        node_id: str,
+        blob_ref: BlobRef,
+        *,
+        mime_type: str | None = None,
+        filename: str | None = None,
+    ) -> str: ...
+
+    def list_content_items(
+        self, node_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]: ...
+
+    def detach_content_item(
+        self, content_item_id: str, *, soft_delete: bool = True
+    ) -> None: ...
 
 
 @runtime_checkable
@@ -125,4 +162,3 @@ class LLMProvider(ProviderInfo, Protocol):
     def generate_structured(self, prompt: str, schema: Mapping[str, Any]) -> Mapping[str, Any]: ...
 
     def chat(self, messages: Sequence[Mapping[str, str]]) -> str: ...
-
