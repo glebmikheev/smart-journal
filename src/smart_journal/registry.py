@@ -10,9 +10,11 @@ from smart_journal.providers import (
     InMemoryMetaStore,
     InMemoryVectorIndex,
     InProcessJobQueue,
+    LocalCASBlobStore,
     MockEmbeddingProvider,
     MockLLMProvider,
     PlainTextExtractor,
+    SQLiteMetaStore,
 )
 
 ProviderConstructor = Callable[[Mapping[str, Any]], ProviderInfo]
@@ -47,14 +49,19 @@ class ProviderRegistry:
         descriptions: list[ProviderDescriptor] = []
         for provider_id, constructor in sorted(constructors.items()):
             provider = constructor({})
-            descriptions.append(
-                ProviderDescriptor(
-                    category=category,
-                    provider_id=provider_id,
-                    version=provider.version(),
-                    capabilities=dict(provider.capabilities()),
+            try:
+                descriptions.append(
+                    ProviderDescriptor(
+                        category=category,
+                        provider_id=provider_id,
+                        version=provider.version(),
+                        capabilities=dict(provider.capabilities()),
+                    )
                 )
-            )
+            finally:
+                closer = getattr(provider, "close", None)
+                if callable(closer):
+                    closer()
         return descriptions
 
     def available_all(self) -> dict[str, list[ProviderDescriptor]]:
@@ -92,9 +99,19 @@ def build_default_registry() -> ProviderRegistry:
         constructor=lambda options: InMemoryBlobStore(options),
     )
     registry.register(
+        category="blob_store",
+        provider_id="local_cas",
+        constructor=lambda options: LocalCASBlobStore(options),
+    )
+    registry.register(
         category="meta_store",
         provider_id="in_memory",
         constructor=lambda options: InMemoryMetaStore(options),
+    )
+    registry.register(
+        category="meta_store",
+        provider_id="sqlite",
+        constructor=lambda options: SQLiteMetaStore(options),
     )
     registry.register(
         category="vector_index",

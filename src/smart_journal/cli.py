@@ -19,7 +19,7 @@ from smart_journal.registry import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smart-journal",
-        description="Smart Journal increment 0 scaffold CLI.",
+        description="Smart Journal increment 1 CLI.",
     )
     parser.add_argument(
         "--config",
@@ -37,7 +37,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run_parser = subparsers.add_parser(
         "run",
-        help="Create empty app shell and print selected providers.",
+        help="Create app shell and print selected providers.",
     )
     run_parser.add_argument("--json", action="store_true", dest="as_json")
 
@@ -62,13 +62,16 @@ def run_cli(argv: list[str] | None = None) -> int:
     if command == "run":
         config = load_config(args.config)
         bundle = ComponentFactory(registry).create(config)
-        selected_payload = _selected_providers_payload(bundle)
-        if args.as_json:
-            print(json.dumps(selected_payload, indent=2, ensure_ascii=False))
-        else:
-            print("Smart Journal scaffold is running.")
-            _print_selected(selected_payload)
-        return 0
+        try:
+            selected_payload = _selected_providers_payload(bundle)
+            if args.as_json:
+                print(json.dumps(selected_payload, indent=2, ensure_ascii=False))
+            else:
+                print("Smart Journal is running.")
+                _print_selected(selected_payload)
+            return 0
+        finally:
+            _close_bundle_resources(bundle)
 
     parser.print_help()
     return 1
@@ -128,6 +131,21 @@ def _print_selected(payload: dict[str, dict[str, Any]]) -> None:
         capabilities = json.dumps(provider["capabilities"], ensure_ascii=False, sort_keys=True)
         print(f"- {category}: {provider['provider_id']} (v{provider['version']})")
         print(f"  capabilities: {capabilities}")
+
+
+def _close_bundle_resources(bundle: ComponentBundle) -> None:
+    for provider in (
+        bundle.blob_store,
+        bundle.meta_store,
+        bundle.vector_index,
+        bundle.job_queue,
+        bundle.extractor,
+        bundle.embedding_provider,
+        bundle.llm_provider,
+    ):
+        closer = getattr(provider, "close", None)
+        if callable(closer):
+            closer()
 
 
 if __name__ == "__main__":
