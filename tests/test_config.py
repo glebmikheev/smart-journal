@@ -8,6 +8,13 @@ from smart_journal.config import AppConfig, load_config
 
 
 class ConfigTests(unittest.TestCase):
+    def test_default_config_uses_increment_one_backends(self) -> None:
+        config = AppConfig()
+        self.assertEqual(config.blob_store.backend, "local_cas")
+        self.assertEqual(config.meta_store.backend, "sqlite")
+        self.assertEqual(config.blob_store.options["root"], "./data/blobs")
+        self.assertEqual(config.meta_store.options["path"], "./data/meta.db")
+
     def test_from_mapping_overrides_backends_and_options(self) -> None:
         config = AppConfig.from_mapping(
             {
@@ -42,4 +49,3 @@ class ConfigTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
-

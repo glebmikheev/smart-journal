@@ -23,7 +23,13 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(provider.provider_id(), "mock_text")
         self.assertTrue(bool(provider.capabilities()["text"]))
 
+    def test_registry_exposes_increment_one_backends(self) -> None:
+        registry = build_default_registry()
+        blob_ids = [descriptor.provider_id for descriptor in registry.available("blob_store")]
+        meta_ids = [descriptor.provider_id for descriptor in registry.available("meta_store")]
+        self.assertIn("local_cas", blob_ids)
+        self.assertIn("sqlite", meta_ids)
+
 
 if __name__ == "__main__":
     unittest.main()
-
