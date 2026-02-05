@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 0 scaffold for the Smart Journal knowledge base.
+Increment 1 baseline for the Smart Journal knowledge base.
 
 ## What is implemented
 
@@ -8,9 +8,13 @@ Increment 0 scaffold for the Smart Journal knowledge base.
 - contract definitions for:
   - `BlobStore`, `MetaStore`, `VectorIndex`, `JobQueue`
   - `Extractor`, `EmbeddingProvider`, `LLMProvider`
+- SQLite `MetaStore` schema v1 with base tables:
+  - `nodes`, `revisions`, `content_items`, `tags`, `groups`, `edges` (+ join tables)
+- local filesystem `BlobStore` with SHA-256 content-addressed storage
+- node CRUD + revisions + file attach/detach metadata
 - config-driven provider selection through factories
-- mock/in-memory providers with `capabilities()` and `version()`
-- CLI that can list providers and start an empty app shell
+- mock/in-memory providers kept for testing and fallback
+- CLI that can list providers and start an app shell
 - CI workflow + lint/type-check config
 
 ## Quick start
@@ -35,10 +39,12 @@ Default config file: `smart-journal.toml`.
 
 ```toml
 [blob_store]
-backend = "in_memory"
+backend = "local_cas"
+root = "./data/blobs"
 
 [meta_store]
-backend = "in_memory"
+backend = "sqlite"
+path = "./data/meta.db"
 
 [vector_index]
 backend = "in_memory"

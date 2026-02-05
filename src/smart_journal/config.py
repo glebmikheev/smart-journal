@@ -18,10 +18,16 @@ class ComponentConfig:
 @dataclass(slots=True)
 class AppConfig:
     blob_store: ComponentConfig = field(
-        default_factory=lambda: ComponentConfig(backend="in_memory")
+        default_factory=lambda: ComponentConfig(
+            backend="local_cas",
+            options={"root": "./data/blobs"},
+        )
     )
     meta_store: ComponentConfig = field(
-        default_factory=lambda: ComponentConfig(backend="in_memory")
+        default_factory=lambda: ComponentConfig(
+            backend="sqlite",
+            options={"path": "./data/meta.db"},
+        )
     )
     vector_index: ComponentConfig = field(
         default_factory=lambda: ComponentConfig(backend="in_memory")
@@ -42,8 +48,16 @@ class AppConfig:
     @classmethod
     def from_mapping(cls, raw: Mapping[str, Any]) -> AppConfig:
         return cls(
-            blob_store=_component_from_section(raw.get("blob_store"), default_backend="in_memory"),
-            meta_store=_component_from_section(raw.get("meta_store"), default_backend="in_memory"),
+            blob_store=_component_from_section(
+                raw.get("blob_store"),
+                default_backend="local_cas",
+                default_options={"root": "./data/blobs"},
+            ),
+            meta_store=_component_from_section(
+                raw.get("meta_store"),
+                default_backend="sqlite",
+                default_options={"path": "./data/meta.db"},
+            ),
             vector_index=_component_from_section(
                 raw.get("vector_index"), default_backend="in_memory"
             ),
@@ -73,14 +87,23 @@ def load_config(config_path: Path | None = None) -> AppConfig:
     return AppConfig.from_mapping(raw_data)
 
 
-def _component_from_section(raw_section: Any, *, default_backend: str) -> ComponentConfig:
+def _component_from_section(
+    raw_section: Any,
+    *,
+    default_backend: str,
+    default_options: Mapping[str, Any] | None = None,
+) -> ComponentConfig:
+    default_options_dict = dict(default_options or {})
     if not isinstance(raw_section, Mapping):
-        return ComponentConfig(backend=default_backend)
+        return ComponentConfig(backend=default_backend, options=default_options_dict)
 
     backend = str(raw_section.get("backend", default_backend))
-    options = {
-        str(key): value
-        for key, value in raw_section.items()
-        if key != "backend"
-    }
+    options = default_options_dict
+    options.update(
+        {
+            str(key): value
+            for key, value in raw_section.items()
+            if key != "backend"
+        }
+    )
     return ComponentConfig(backend=backend, options=options)

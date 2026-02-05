@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "smart-journal"
-version = "0.1.0"
-description = "Smart Journal increment 0 scaffold."
+version = "0.2.0"
+description = "Smart Journal increment 1 baseline."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
@@ -37,4 +37,3 @@ python_version = "3.12"
 strict = true
 pretty = true
 packages = ["smart_journal"]
-

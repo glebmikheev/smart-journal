@@ -1,8 +1,10 @@
 [blob_store]
-backend = "in_memory"
+backend = "local_cas"
+root = "./data/blobs"
 
 [meta_store]
-backend = "in_memory"
+backend = "sqlite"
+path = "./data/meta.db"
 
 [vector_index]
 backend = "in_memory"
@@ -20,4 +22,3 @@ normalize = true
 
 [llm_provider]
 backend = "mock_chat"
-
