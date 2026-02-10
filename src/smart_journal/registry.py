@@ -6,6 +6,7 @@ from typing import Any
 
 from smart_journal.contracts import Capabilities, ProviderInfo
 from smart_journal.providers import (
+    BasicExtractorV1,
     InMemoryBlobStore,
     InMemoryMetaStore,
     InMemoryVectorIndex,
@@ -127,6 +128,11 @@ def build_default_registry() -> ProviderRegistry:
         category="extractor",
         provider_id="plain_text",
         constructor=lambda options: PlainTextExtractor(options),
+    )
+    registry.register(
+        category="extractor",
+        provider_id="basic_v1",
+        constructor=lambda options: BasicExtractorV1(options),
     )
     registry.register(
         category="embedding_provider",

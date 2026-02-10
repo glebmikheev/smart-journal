@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import math
+import re
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -19,7 +20,7 @@ class InMemoryBlobStore:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
@@ -63,19 +64,20 @@ class InMemoryMetaStore:
         self._nodes: dict[str, dict[str, Any]] = {}
         self._revisions_by_node: dict[str, list[dict[str, Any]]] = {}
         self._content_items: dict[str, dict[str, Any]] = {}
+        self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
 
     def provider_id(self) -> str:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": False,
             "fulltext_backend": "none",
             "durable": False,
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
     def begin_transaction(self) -> None:
@@ -176,6 +178,7 @@ class InMemoryMetaStore:
         for content_item_id, item in list(self._content_items.items()):
             if item["node_id"] == node_id:
                 self._content_items.pop(content_item_id, None)
+                self._chunks_by_content_item.pop(content_item_id, None)
 
     def list_nodes(
         self, graph_id: str, *, include_deleted: bool = False
@@ -221,9 +224,13 @@ class InMemoryMetaStore:
             "blob_version": blob_ref.version,
             "mime_type": mime_type,
             "filename": filename,
+            "extraction_status": "pending",
+            "extracted_text": "",
+            "extraction_error": None,
             "created_at": _utc_now(),
             "deleted_at": None,
         }
+        self._chunks_by_content_item.setdefault(content_item_id, [])
         return content_item_id
 
     def list_content_items(
@@ -237,6 +244,16 @@ class InMemoryMetaStore:
         items.sort(key=lambda item: str(item["created_at"]))
         return items
 
+    def get_content_item(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None:
+        item = self._content_items.get(content_item_id)
+        if item is None:
+            return None
+        if not include_deleted and item["deleted_at"] is not None:
+            return None
+        return dict(item)
+
     def detach_content_item(self, content_item_id: str, *, soft_delete: bool = True) -> None:
         item = self._content_items.get(content_item_id)
         if item is None:
@@ -245,6 +262,66 @@ class InMemoryMetaStore:
             item["deleted_at"] = _utc_now()
             return
         self._content_items.pop(content_item_id, None)
+        self._chunks_by_content_item.pop(content_item_id, None)
+
+    def set_content_item_extraction(
+        self,
+        content_item_id: str,
+        *,
+        status: str,
+        extracted_text: str | None = None,
+        metadata: Mapping[str, str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        _ = metadata
+        item = self._content_items.get(content_item_id)
+        if item is None or item["deleted_at"] is not None:
+            raise KeyError(f"Content item not found or deleted: {content_item_id}")
+        item["extraction_status"] = status
+        if extracted_text is not None:
+            item["extracted_text"] = extracted_text
+        item["extraction_error"] = error
+        item["updated_at"] = _utc_now()
+
+    def replace_content_item_chunks(
+        self,
+        content_item_id: str,
+        chunks: Sequence[Mapping[str, str | int]],
+    ) -> list[str]:
+        item = self._content_items.get(content_item_id)
+        if item is None or item["deleted_at"] is not None:
+            raise KeyError(f"Content item not found or deleted: {content_item_id}")
+        created_chunk_ids: list[str] = []
+        new_rows: list[dict[str, Any]] = []
+        for chunk in chunks:
+            chunk_id = str(uuid4())
+            created_chunk_ids.append(chunk_id)
+            new_rows.append(
+                {
+                    "chunk_id": chunk_id,
+                    "content_item_id": content_item_id,
+                    "node_id": item["node_id"],
+                    "chunk_index": int(chunk["chunk_index"]),
+                    "text": str(chunk["text"]),
+                    "checksum": str(chunk["checksum"]),
+                    "created_at": _utc_now(),
+                    "deleted_at": None,
+                }
+            )
+        self._chunks_by_content_item[content_item_id] = new_rows
+        return created_chunk_ids
+
+    def list_chunks(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]:
+        chunks = self._chunks_by_content_item.get(content_item_id, [])
+        payload: list[Mapping[str, Any]] = [
+            dict(chunk)
+            for chunk in chunks
+            if include_deleted or chunk["deleted_at"] is None
+        ]
+        payload.sort(key=lambda chunk: int(chunk["chunk_index"]))
+        return payload
 
 
 class InMemoryVectorIndex:
@@ -255,7 +332,7 @@ class InMemoryVectorIndex:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
@@ -291,30 +368,66 @@ class InMemoryVectorIndex:
 
 class InProcessJobQueue:
     def __init__(self, _: Mapping[str, Any] | None = None) -> None:
-        self._jobs: deque[tuple[str, str, Mapping[str, Any]]] = deque()
+        self._jobs: dict[str, dict[str, Any]] = {}
+        self._queued_ids: deque[str] = deque()
 
     def provider_id(self) -> str:
         return "in_process"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "durable": False,
             "priority_levels": 1,
+            "statuses": ["queued", "running", "completed", "failed"],
         }
 
     def enqueue(self, job_name: str, payload: Mapping[str, Any]) -> str:
         job_id = str(uuid4())
-        self._jobs.append((job_id, job_name, dict(payload)))
+        timestamp = _utc_now()
+        self._jobs[job_id] = {
+            "job_id": job_id,
+            "job_name": job_name,
+            "payload": dict(payload),
+            "status": "queued",
+            "error": None,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "started_at": None,
+            "finished_at": None,
+        }
+        self._queued_ids.append(job_id)
         return job_id
 
     def run_next(self) -> str | None:
-        if not self._jobs:
+        if not self._queued_ids:
             return None
-        job_id, _, _ = self._jobs.popleft()
+        job_id = self._queued_ids.popleft()
+        job = self._jobs[job_id]
+        timestamp = _utc_now()
+        job["status"] = "running"
+        job["started_at"] = timestamp
+        job["updated_at"] = timestamp
         return job_id
+
+    def set_status(self, job_id: str, status: str, *, error: str | None = None) -> None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            raise KeyError(f"Unknown job_id: {job_id}")
+        timestamp = _utc_now()
+        job["status"] = status
+        job["error"] = error
+        job["updated_at"] = timestamp
+        if status in {"completed", "failed"}:
+            job["finished_at"] = timestamp
+
+    def get_job(self, job_id: str) -> Mapping[str, Any] | None:
+        job = self._jobs.get(job_id)
+        if job is None:
+            return None
+        return dict(job)
 
 
 class PlainTextExtractor:
@@ -325,7 +438,7 @@ class PlainTextExtractor:
         return "plain_text"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
@@ -347,6 +460,78 @@ class PlainTextExtractor:
         )
 
 
+class BasicExtractorV1:
+    def __init__(self, _: Mapping[str, Any] | None = None) -> None:
+        self._text_mimes = {"text/plain", "text/markdown"}
+        self._pdf_mimes = {"application/pdf"}
+        self._image_mimes = {"image/png", "image/jpeg", "image/webp"}
+        self._audio_mimes = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg"}
+        self._video_mimes = {"video/mp4", "video/webm", "video/quicktime"}
+        self._supported_mime_types = (
+            self._text_mimes
+            | self._pdf_mimes
+            | self._image_mimes
+            | self._audio_mimes
+            | self._video_mimes
+        )
+
+    def provider_id(self) -> str:
+        return "basic_v1"
+
+    def version(self) -> str:
+        return "0.2.0"
+
+    def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
+        return {
+            "mime_types": sorted(
+                self._supported_mime_types
+            ),
+            "outputs": ["text", "thumbnail", "metadata"],
+        }
+
+    def supports_mime(self, mime_type: str) -> bool:
+        return mime_type in self._supported_mime_types
+
+    def extract(self, content: bytes, *, mime_type: str) -> ExtractedArtifact:
+        if mime_type in self._text_mimes:
+            text = content.decode("utf-8", errors="replace")
+            return ExtractedArtifact(
+                content_type="text/plain",
+                text=text,
+                metadata={"source_mime_type": mime_type},
+            )
+        if mime_type in self._pdf_mimes:
+            text = _extract_pdf_text(content)
+            return ExtractedArtifact(
+                content_type="text/plain",
+                text=text,
+                metadata={"source_mime_type": mime_type},
+            )
+        if mime_type in self._image_mimes:
+            digest = hashlib.sha256(content).hexdigest()
+            return ExtractedArtifact(
+                content_type="image/thumbnail",
+                text=None,
+                metadata={
+                    "source_mime_type": mime_type,
+                    "thumbnail_checksum": digest,
+                    "source_size_bytes": str(len(content)),
+                },
+            )
+        if mime_type in self._audio_mimes or mime_type in self._video_mimes:
+            media_type = "audio" if mime_type in self._audio_mimes else "video"
+            return ExtractedArtifact(
+                content_type=f"{media_type}/metadata",
+                text=None,
+                metadata={
+                    "source_mime_type": mime_type,
+                    "media_type": media_type,
+                    "source_size_bytes": str(len(content)),
+                },
+            )
+        raise ValueError(f"Unsupported MIME type: {mime_type}")
+
+
 class MockEmbeddingProvider:
     def __init__(self, options: Mapping[str, Any] | None = None) -> None:
         options = options or {}
@@ -357,7 +542,7 @@ class MockEmbeddingProvider:
         return "mock_text"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
@@ -415,7 +600,7 @@ class MockLLMProvider:
         return "mock_chat"
 
     def version(self) -> str:
-        return "0.1.0"
+        return "0.2.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
@@ -455,6 +640,26 @@ def _cosine_similarity(lhs: Sequence[float], rhs: Sequence[float]) -> float:
     if lhs_norm == 0.0 or rhs_norm == 0.0:
         return 0.0
     return dot / (lhs_norm * rhs_norm)
+
+
+def _extract_pdf_text(payload: bytes) -> str:
+    text_parts: list[str] = []
+    for literal in re.findall(rb"\((.*?)\)\s*Tj", payload, flags=re.S):
+        text_parts.append(_decode_pdf_literal(literal))
+    for array_payload in re.findall(rb"\[(.*?)\]\s*TJ", payload, flags=re.S):
+        for literal in re.findall(rb"\((.*?)\)", array_payload, flags=re.S):
+            text_parts.append(_decode_pdf_literal(literal))
+    if not text_parts:
+        decoded = payload.decode("latin-1", errors="ignore")
+        text_parts.extend(re.findall(r"\(([^()]*)\)", decoded))
+    return " ".join(part.strip() for part in text_parts if part.strip())
+
+
+def _decode_pdf_literal(raw_literal: bytes) -> str:
+    text = raw_literal.decode("latin-1", errors="ignore")
+    text = text.replace(r"\n", "\n").replace(r"\r", "\r").replace(r"\t", "\t")
+    text = text.replace(r"\(", "(").replace(r"\)", ")").replace(r"\\", "\\")
+    return text
 
 
 def _utc_now() -> str:
