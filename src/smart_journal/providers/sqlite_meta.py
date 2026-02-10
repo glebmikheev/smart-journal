@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+import json
 import sqlite3
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -44,7 +45,7 @@ class SQLiteMetaStore:
             "transactions": True,
             "fulltext_backend": "none",
             "durable": True,
-            "schema_version": 1,
+            "schema_version": 2,
         }
 
     def begin_transaction(self) -> None:
@@ -213,10 +214,14 @@ class SQLiteMetaStore:
                     blob_version,
                     mime_type,
                     filename,
+                    extraction_status,
+                    extracted_text,
+                    extracted_metadata_json,
+                    extraction_error,
                     created_at,
                     deleted_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', '', '{}', NULL, ?, NULL)
                 """,
                 (
                     content_item_id,
@@ -242,11 +247,22 @@ class SQLiteMetaStore:
             query += " AND deleted_at IS NULL"
         query += " ORDER BY created_at ASC"
         rows = self._connection.execute(query, params).fetchall()
-        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        payload: list[Mapping[str, Any]] = [_content_item_row_to_dict(row) for row in rows]
         return payload
+
+    def get_content_item(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None:
+        query = "SELECT * FROM content_items WHERE content_item_id = ?"
+        params: tuple[Any, ...] = (content_item_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        row = self._connection.execute(query, params).fetchone()
+        return _content_item_row_to_dict(row) if row is not None else None
 
     def detach_content_item(self, content_item_id: str, *, soft_delete: bool = True) -> None:
         if soft_delete:
+            timestamp = _utc_now()
             with self._connection:
                 self._connection.execute(
                     """
@@ -254,15 +270,130 @@ class SQLiteMetaStore:
                     SET deleted_at = ?
                     WHERE content_item_id = ? AND deleted_at IS NULL
                     """,
-                    (_utc_now(), content_item_id),
+                    (timestamp, content_item_id),
+                )
+                self._connection.execute(
+                    """
+                    UPDATE chunks
+                    SET deleted_at = ?
+                    WHERE content_item_id = ? AND deleted_at IS NULL
+                    """,
+                    (timestamp, content_item_id),
                 )
             return
 
         with self._connection:
             self._connection.execute(
+                "DELETE FROM chunks WHERE content_item_id = ?",
+                (content_item_id,),
+            )
+            self._connection.execute(
                 "DELETE FROM content_items WHERE content_item_id = ?",
                 (content_item_id,),
             )
+
+    def set_content_item_extraction(
+        self,
+        content_item_id: str,
+        *,
+        status: str,
+        extracted_text: str | None = None,
+        metadata: Mapping[str, str] | None = None,
+        error: str | None = None,
+    ) -> None:
+        row = self._connection.execute(
+            """
+            SELECT extracted_text, extracted_metadata_json
+            FROM content_items
+            WHERE content_item_id = ? AND deleted_at IS NULL
+            """,
+            (content_item_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Content item not found or deleted: {content_item_id}")
+
+        next_text = str(row["extracted_text"]) if extracted_text is None else extracted_text
+        next_metadata_json = (
+            str(row["extracted_metadata_json"])
+            if metadata is None
+            else json.dumps(dict(metadata), ensure_ascii=False, sort_keys=True)
+        )
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE content_items
+                SET extraction_status = ?,
+                    extracted_text = ?,
+                    extracted_metadata_json = ?,
+                    extraction_error = ?
+                WHERE content_item_id = ?
+                """,
+                (status, next_text, next_metadata_json, error, content_item_id),
+            )
+
+    def replace_content_item_chunks(
+        self,
+        content_item_id: str,
+        chunks: Sequence[Mapping[str, str | int]],
+    ) -> list[str]:
+        row = self._connection.execute(
+            """
+            SELECT node_id
+            FROM content_items
+            WHERE content_item_id = ? AND deleted_at IS NULL
+            """,
+            (content_item_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Content item not found or deleted: {content_item_id}")
+        node_id = str(row["node_id"])
+        created_ids: list[str] = []
+
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM chunks WHERE content_item_id = ?",
+                (content_item_id,),
+            )
+            for chunk in chunks:
+                chunk_id = str(uuid4())
+                created_ids.append(chunk_id)
+                self._connection.execute(
+                    """
+                    INSERT INTO chunks(
+                        chunk_id,
+                        content_item_id,
+                        node_id,
+                        chunk_index,
+                        text,
+                        checksum,
+                        created_at,
+                        deleted_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, NULL)
+                    """,
+                    (
+                        chunk_id,
+                        content_item_id,
+                        node_id,
+                        int(chunk["chunk_index"]),
+                        str(chunk["text"]),
+                        str(chunk["checksum"]),
+                        _utc_now(),
+                    ),
+                )
+        return created_ids
+
+    def list_chunks(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM chunks WHERE content_item_id = ?"
+        params: tuple[Any, ...] = (content_item_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        query += " ORDER BY chunk_index ASC"
+        rows = self._connection.execute(query, params).fetchall()
+        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
 
     def _initialize_schema(self) -> None:
         self._connection.executescript(
@@ -315,6 +446,10 @@ class SQLiteMetaStore:
                 blob_version TEXT,
                 mime_type TEXT,
                 filename TEXT,
+                extraction_status TEXT NOT NULL DEFAULT 'pending',
+                extracted_text TEXT NOT NULL DEFAULT '',
+                extracted_metadata_json TEXT NOT NULL DEFAULT '{}',
+                extraction_error TEXT,
                 created_at TEXT NOT NULL,
                 deleted_at TEXT
             );
@@ -369,16 +504,57 @@ class SQLiteMetaStore:
             CREATE INDEX IF NOT EXISTS idx_edges_from_node_id ON edges(from_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_to_node_id ON edges(to_node_id);
             CREATE INDEX IF NOT EXISTS idx_edges_status ON edges(status);
+
+            CREATE TABLE IF NOT EXISTS chunks(
+                chunk_id TEXT PRIMARY KEY,
+                content_item_id TEXT NOT NULL
+                    REFERENCES content_items(content_item_id) ON DELETE CASCADE,
+                node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
+                chunk_index INTEGER NOT NULL,
+                text TEXT NOT NULL,
+                checksum TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                deleted_at TEXT,
+                UNIQUE(content_item_id, chunk_index)
+            );
+            CREATE INDEX IF NOT EXISTS idx_chunks_content_item_id ON chunks(content_item_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_node_id ON chunks(node_id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at);
             """
         )
+        self._ensure_content_item_columns()
         with self._connection:
             self._connection.execute(
                 """
                 INSERT INTO schema_info(key, value)
-                VALUES ('schema_version', '1')
+                VALUES ('schema_version', '2')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
+
+    def _ensure_content_item_columns(self) -> None:
+        rows = self._connection.execute("PRAGMA table_info(content_items)").fetchall()
+        existing_columns = {str(row["name"]) for row in rows}
+        required_columns = {
+            "extraction_status": (
+                "ALTER TABLE content_items ADD COLUMN extraction_status "
+                "TEXT NOT NULL DEFAULT 'pending'"
+            ),
+            "extracted_text": (
+                "ALTER TABLE content_items ADD COLUMN extracted_text "
+                "TEXT NOT NULL DEFAULT ''"
+            ),
+            "extracted_metadata_json": (
+                "ALTER TABLE content_items ADD COLUMN extracted_metadata_json "
+                "TEXT NOT NULL DEFAULT '{}'"
+            ),
+            "extraction_error": "ALTER TABLE content_items ADD COLUMN extraction_error TEXT",
+        }
+        for column_name, statement in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            with self._connection:
+                self._connection.execute(statement)
 
     def _insert_revision(
         self,
@@ -432,6 +608,24 @@ class SQLiteMetaStore:
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {str(key): row[key] for key in row.keys()}
+
+
+def _content_item_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    payload = _row_to_dict(row)
+    raw_metadata = payload.get("extracted_metadata_json")
+    parsed_metadata: Mapping[str, str] = {}
+    if isinstance(raw_metadata, str) and raw_metadata:
+        try:
+            loaded = json.loads(raw_metadata)
+            if isinstance(loaded, dict):
+                parsed_metadata = {
+                    str(key): str(value)
+                    for key, value in loaded.items()
+                }
+        except json.JSONDecodeError:
+            parsed_metadata = {}
+    payload["extracted_metadata"] = parsed_metadata
+    return payload
 
 
 def _utc_now() -> str:
