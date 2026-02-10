@@ -102,9 +102,33 @@ class MetaStore(ProviderInfo, Protocol):
         self, node_id: str, *, include_deleted: bool = False
     ) -> list[Mapping[str, Any]]: ...
 
+    def get_content_item(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None: ...
+
     def detach_content_item(
         self, content_item_id: str, *, soft_delete: bool = True
     ) -> None: ...
+
+    def set_content_item_extraction(
+        self,
+        content_item_id: str,
+        *,
+        status: str,
+        extracted_text: str | None = None,
+        metadata: Mapping[str, str] | None = None,
+        error: str | None = None,
+    ) -> None: ...
+
+    def replace_content_item_chunks(
+        self,
+        content_item_id: str,
+        chunks: Sequence[Mapping[str, str | int]],
+    ) -> list[str]: ...
+
+    def list_chunks(
+        self, content_item_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]: ...
 
 
 @runtime_checkable
@@ -125,6 +149,10 @@ class JobQueue(ProviderInfo, Protocol):
     def enqueue(self, job_name: str, payload: Mapping[str, Any]) -> str: ...
 
     def run_next(self) -> str | None: ...
+
+    def set_status(self, job_id: str, status: str, *, error: str | None = None) -> None: ...
+
+    def get_job(self, job_id: str) -> Mapping[str, Any] | None: ...
 
 
 @runtime_checkable
