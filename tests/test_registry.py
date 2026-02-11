@@ -27,8 +27,10 @@ class RegistryTests(unittest.TestCase):
         registry = build_default_registry()
         blob_ids = [descriptor.provider_id for descriptor in registry.available("blob_store")]
         meta_ids = [descriptor.provider_id for descriptor in registry.available("meta_store")]
+        extractor_ids = [descriptor.provider_id for descriptor in registry.available("extractor")]
         self.assertIn("local_cas", blob_ids)
         self.assertIn("sqlite", meta_ids)
+        self.assertIn("basic_v1", extractor_ids)
 
 
 if __name__ == "__main__":
