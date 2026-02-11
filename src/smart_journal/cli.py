@@ -19,7 +19,7 @@ from smart_journal.registry import (
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smart-journal",
-        description="Smart Journal increment 1 CLI.",
+        description="Smart Journal increment 2 CLI.",
     )
     parser.add_argument(
         "--config",

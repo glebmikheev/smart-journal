@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 1 baseline for the Smart Journal knowledge base.
+Increment 2 baseline for the Smart Journal knowledge base.
 
 ## What is implemented
 
@@ -10,8 +10,18 @@ Increment 1 baseline for the Smart Journal knowledge base.
   - `Extractor`, `EmbeddingProvider`, `LLMProvider`
 - SQLite `MetaStore` schema v1 with base tables:
   - `nodes`, `revisions`, `content_items`, `tags`, `groups`, `edges` (+ join tables)
+- ingestion extensions in MetaStore:
+  - extraction status/text for `content_items`
+  - `chunks` table with checksum per text chunk
 - local filesystem `BlobStore` with SHA-256 content-addressed storage
 - node CRUD + revisions + file attach/detach metadata
+- in-process `JobQueue` with explicit statuses: `queued/running/completed/failed`
+- extractor backend `basic_v1`:
+  - plain text / markdown
+  - PDF -> text
+  - image -> thumbnail metadata (no OCR)
+  - audio/video -> metadata-only (alpha)
+- ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
 - config-driven provider selection through factories
 - mock/in-memory providers kept for testing and fallback
 - CLI that can list providers and start an app shell
@@ -53,7 +63,7 @@ backend = "in_memory"
 backend = "in_process"
 
 [extractor]
-backend = "plain_text"
+backend = "basic_v1"
 
 [embedding_provider]
 backend = "mock_text"

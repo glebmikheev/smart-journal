@@ -36,7 +36,7 @@ class AppConfig:
         default_factory=lambda: ComponentConfig(backend="in_process")
     )
     extractor: ComponentConfig = field(
-        default_factory=lambda: ComponentConfig(backend="plain_text")
+        default_factory=lambda: ComponentConfig(backend="basic_v1")
     )
     embedding_provider: ComponentConfig = field(
         default_factory=lambda: ComponentConfig(backend="mock_text")
@@ -62,7 +62,7 @@ class AppConfig:
                 raw.get("vector_index"), default_backend="in_memory"
             ),
             job_queue=_component_from_section(raw.get("job_queue"), default_backend="in_process"),
-            extractor=_component_from_section(raw.get("extractor"), default_backend="plain_text"),
+            extractor=_component_from_section(raw.get("extractor"), default_backend="basic_v1"),
             embedding_provider=_component_from_section(
                 raw.get("embedding_provider"),
                 default_backend="mock_text",
