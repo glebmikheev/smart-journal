@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 2 baseline for the Smart Journal knowledge base.
+Increment 3 baseline for the Smart Journal knowledge base.
 
 ## What is implemented
 
@@ -22,6 +22,9 @@ Increment 2 baseline for the Smart Journal knowledge base.
   - image -> thumbnail metadata (no OCR)
   - audio/video -> metadata-only (alpha)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
+- FTS5 full-text search index in SQLite meta store
+- Search API with scope filters: graph, group, tags
+- CRUD for tags/groups and node-to-tag/node-to-group relations
 - config-driven provider selection through factories
 - mock/in-memory providers kept for testing and fallback
 - CLI that can list providers and start an app shell
