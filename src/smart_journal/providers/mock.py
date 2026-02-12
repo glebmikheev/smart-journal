@@ -65,19 +65,24 @@ class InMemoryMetaStore:
         self._revisions_by_node: dict[str, list[dict[str, Any]]] = {}
         self._content_items: dict[str, dict[str, Any]] = {}
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
+        self._tags: dict[str, dict[str, Any]] = {}
+        self._groups: dict[str, dict[str, Any]] = {}
+        self._node_tags: dict[str, set[str]] = {}
+        self._node_groups: dict[str, set[str]] = {}
 
     def provider_id(self) -> str:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.2.0"
+        return "0.4.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": False,
-            "fulltext_backend": "none",
+            "fulltext_backend": "naive",
             "durable": False,
-            "schema_version": 2,
+            "schema_version": 3,
+            "supports_scope_filters": True,
         }
 
     def begin_transaction(self) -> None:
@@ -175,6 +180,8 @@ class InMemoryMetaStore:
 
         self._nodes.pop(node_id, None)
         self._revisions_by_node.pop(node_id, None)
+        self._node_tags.pop(node_id, None)
+        self._node_groups.pop(node_id, None)
         for content_item_id, item in list(self._content_items.items()):
             if item["node_id"] == node_id:
                 self._content_items.pop(content_item_id, None)
@@ -322,6 +329,188 @@ class InMemoryMetaStore:
         ]
         payload.sort(key=lambda chunk: int(chunk["chunk_index"]))
         return payload
+
+    def create_tag(self, graph_id: str, name: str) -> str:
+        if self.get_graph(graph_id) is None:
+            raise KeyError(f"Graph not found or deleted: {graph_id}")
+        for tag in self._tags.values():
+            if tag["graph_id"] == graph_id and tag["name"] == name and tag["deleted_at"] is None:
+                raise ValueError(f"Tag already exists in graph '{graph_id}': {name}")
+        tag_id = str(uuid4())
+        self._tags[tag_id] = {
+            "tag_id": tag_id,
+            "graph_id": graph_id,
+            "name": name,
+            "created_at": _utc_now(),
+            "deleted_at": None,
+        }
+        return tag_id
+
+    def list_tags(self, graph_id: str, *, include_deleted: bool = False) -> list[Mapping[str, Any]]:
+        tags: list[Mapping[str, Any]] = [
+            dict(tag)
+            for tag in self._tags.values()
+            if tag["graph_id"] == graph_id and (include_deleted or tag["deleted_at"] is None)
+        ]
+        tags.sort(key=lambda item: str(item["name"]).lower())
+        return tags
+
+    def delete_tag(self, tag_id: str, *, soft_delete: bool = True) -> None:
+        tag = self._tags.get(tag_id)
+        if tag is None:
+            return
+        if soft_delete:
+            tag["deleted_at"] = _utc_now()
+            return
+        self._tags.pop(tag_id, None)
+        for tags in self._node_tags.values():
+            tags.discard(tag_id)
+
+    def add_node_tag(self, node_id: str, tag_id: str) -> None:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        tag = self._require_live_tag(tag_id)
+        if str(node["graph_id"]) != str(tag["graph_id"]):
+            raise ValueError("Node and tag must belong to the same graph.")
+        self._node_tags.setdefault(node_id, set()).add(tag_id)
+
+    def remove_node_tag(self, node_id: str, tag_id: str) -> None:
+        self._node_tags.get(node_id, set()).discard(tag_id)
+
+    def list_node_tags(self, node_id: str) -> list[Mapping[str, Any]]:
+        tag_ids = self._node_tags.get(node_id, set())
+        tags: list[Mapping[str, Any]] = []
+        for tag_id in sorted(tag_ids):
+            tag = self._tags.get(tag_id)
+            if tag is None or tag["deleted_at"] is not None:
+                continue
+            tags.append(dict(tag))
+        return tags
+
+    def create_group(self, graph_id: str, name: str) -> str:
+        if self.get_graph(graph_id) is None:
+            raise KeyError(f"Graph not found or deleted: {graph_id}")
+        for group in self._groups.values():
+            if (
+                group["graph_id"] == graph_id
+                and group["name"] == name
+                and group["deleted_at"] is None
+            ):
+                raise ValueError(f"Group already exists in graph '{graph_id}': {name}")
+        group_id = str(uuid4())
+        self._groups[group_id] = {
+            "group_id": group_id,
+            "graph_id": graph_id,
+            "name": name,
+            "created_at": _utc_now(),
+            "deleted_at": None,
+        }
+        return group_id
+
+    def list_groups(
+        self, graph_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]:
+        groups: list[Mapping[str, Any]] = [
+            dict(group)
+            for group in self._groups.values()
+            if group["graph_id"] == graph_id and (include_deleted or group["deleted_at"] is None)
+        ]
+        groups.sort(key=lambda item: str(item["name"]).lower())
+        return groups
+
+    def delete_group(self, group_id: str, *, soft_delete: bool = True) -> None:
+        group = self._groups.get(group_id)
+        if group is None:
+            return
+        if soft_delete:
+            group["deleted_at"] = _utc_now()
+            return
+        self._groups.pop(group_id, None)
+        for groups in self._node_groups.values():
+            groups.discard(group_id)
+
+    def add_node_to_group(self, node_id: str, group_id: str) -> None:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        group = self._require_live_group(group_id)
+        if str(node["graph_id"]) != str(group["graph_id"]):
+            raise ValueError("Node and group must belong to the same graph.")
+        self._node_groups.setdefault(node_id, set()).add(group_id)
+
+    def remove_node_from_group(self, node_id: str, group_id: str) -> None:
+        self._node_groups.get(node_id, set()).discard(group_id)
+
+    def list_node_groups(self, node_id: str) -> list[Mapping[str, Any]]:
+        group_ids = self._node_groups.get(node_id, set())
+        groups: list[Mapping[str, Any]] = []
+        for group_id in sorted(group_ids):
+            group = self._groups.get(group_id)
+            if group is None or group["deleted_at"] is not None:
+                continue
+            groups.append(dict(group))
+        return groups
+
+    def search_fulltext(
+        self,
+        query: str,
+        *,
+        graph_id: str | None = None,
+        group_id: str | None = None,
+        tag_ids: Sequence[str] | None = None,
+        limit: int = 20,
+    ) -> list[Mapping[str, Any]]:
+        normalized = query.strip().lower()
+        if not normalized or limit <= 0:
+            return []
+        search_tokens = [token for token in normalized.split() if token]
+        tag_filter = set(tag_ids or [])
+
+        scored: list[tuple[int, dict[str, Any]]] = []
+        for raw_node in self._nodes.values():
+            if raw_node["deleted_at"] is not None:
+                continue
+            if graph_id is not None and str(raw_node["graph_id"]) != graph_id:
+                continue
+            node_id = str(raw_node["node_id"])
+            if group_id is not None and group_id not in self._node_groups.get(node_id, set()):
+                continue
+            if tag_filter and not tag_filter.issubset(self._node_tags.get(node_id, set())):
+                continue
+
+            content_texts = [
+                str(item.get("extracted_text", ""))
+                for item in self._content_items.values()
+                if item["node_id"] == node_id
+                and item["deleted_at"] is None
+                and item["extraction_status"] == "done"
+            ]
+            haystack = " ".join(
+                [str(raw_node["title"]), str(raw_node["body"]), " ".join(content_texts)]
+            ).lower()
+            if not all(token in haystack for token in search_tokens):
+                continue
+
+            score = sum(haystack.count(token) for token in search_tokens)
+            node_payload = dict(raw_node)
+            node_payload["score"] = float(score)
+            scored.append((score, node_payload))
+
+        scored.sort(key=lambda item: (item[0], str(item[1]["updated_at"])), reverse=True)
+        return [payload for _, payload in scored[:limit]]
+
+    def _require_live_tag(self, tag_id: str) -> Mapping[str, Any]:
+        tag = self._tags.get(tag_id)
+        if tag is None or tag["deleted_at"] is not None:
+            raise KeyError(f"Tag not found or deleted: {tag_id}")
+        return tag
+
+    def _require_live_group(self, group_id: str) -> Mapping[str, Any]:
+        group = self._groups.get(group_id)
+        if group is None or group["deleted_at"] is not None:
+            raise KeyError(f"Group not found or deleted: {group_id}")
+        return group
 
 
 class InMemoryVectorIndex:

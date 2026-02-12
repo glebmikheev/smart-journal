@@ -38,14 +38,15 @@ class SQLiteMetaStore:
         return "sqlite"
 
     def version(self) -> str:
-        return "0.2.0"
+        return "0.4.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": True,
-            "fulltext_backend": "none",
+            "fulltext_backend": "fts5",
             "durable": True,
-            "schema_version": 2,
+            "schema_version": 3,
+            "supports_scope_filters": True,
         }
 
     def begin_transaction(self) -> None:
@@ -107,6 +108,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._refresh_node_search_index(node_id)
         return node_id
 
     def update_node(
@@ -139,6 +141,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._refresh_node_search_index(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
         if soft_delete:
@@ -152,10 +155,12 @@ class SQLiteMetaStore:
                     """,
                     (timestamp, timestamp, node_id),
                 )
+                self._refresh_node_search_index(node_id)
             return
 
         with self._connection:
             self._connection.execute("DELETE FROM nodes WHERE node_id = ?", (node_id,))
+            self._refresh_node_search_index(node_id)
 
     def list_nodes(
         self, graph_id: str, *, include_deleted: bool = False
@@ -236,6 +241,7 @@ class SQLiteMetaStore:
                     timestamp,
                 ),
             )
+            self._refresh_node_search_index(node_id)
         return content_item_id
 
     def list_content_items(
@@ -261,6 +267,14 @@ class SQLiteMetaStore:
         return _content_item_row_to_dict(row) if row is not None else None
 
     def detach_content_item(self, content_item_id: str, *, soft_delete: bool = True) -> None:
+        row = self._connection.execute(
+            "SELECT node_id FROM content_items WHERE content_item_id = ?",
+            (content_item_id,),
+        ).fetchone()
+        if row is None:
+            return
+        node_id = str(row["node_id"])
+
         if soft_delete:
             timestamp = _utc_now()
             with self._connection:
@@ -280,6 +294,7 @@ class SQLiteMetaStore:
                     """,
                     (timestamp, content_item_id),
                 )
+                self._refresh_node_search_index(node_id)
             return
 
         with self._connection:
@@ -291,6 +306,7 @@ class SQLiteMetaStore:
                 "DELETE FROM content_items WHERE content_item_id = ?",
                 (content_item_id,),
             )
+            self._refresh_node_search_index(node_id)
 
     def set_content_item_extraction(
         self,
@@ -303,7 +319,7 @@ class SQLiteMetaStore:
     ) -> None:
         row = self._connection.execute(
             """
-            SELECT extracted_text, extracted_metadata_json
+            SELECT node_id, extracted_text, extracted_metadata_json
             FROM content_items
             WHERE content_item_id = ? AND deleted_at IS NULL
             """,
@@ -330,6 +346,7 @@ class SQLiteMetaStore:
                 """,
                 (status, next_text, next_metadata_json, error, content_item_id),
             )
+            self._refresh_node_search_index(str(row["node_id"]))
 
     def replace_content_item_chunks(
         self,
@@ -393,6 +410,228 @@ class SQLiteMetaStore:
         query += " ORDER BY chunk_index ASC"
         rows = self._connection.execute(query, params).fetchall()
         payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
+
+    def create_tag(self, graph_id: str, name: str) -> str:
+        self._require_live_graph(graph_id)
+        tag_id = str(uuid4())
+        with self._connection:
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO tags(tag_id, graph_id, name, created_at, deleted_at)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (tag_id, graph_id, name, _utc_now()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"Tag already exists in graph '{graph_id}': {name}") from error
+        return tag_id
+
+    def list_tags(self, graph_id: str, *, include_deleted: bool = False) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM tags WHERE graph_id = ?"
+        params: tuple[Any, ...] = (graph_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        query += " ORDER BY name ASC"
+        rows = self._connection.execute(query, params).fetchall()
+        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
+
+    def delete_tag(self, tag_id: str, *, soft_delete: bool = True) -> None:
+        if soft_delete:
+            with self._connection:
+                self._connection.execute(
+                    "UPDATE tags SET deleted_at = ? WHERE tag_id = ? AND deleted_at IS NULL",
+                    (_utc_now(), tag_id),
+                )
+            return
+
+        with self._connection:
+            self._connection.execute("DELETE FROM tags WHERE tag_id = ?", (tag_id,))
+
+    def add_node_tag(self, node_id: str, tag_id: str) -> None:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        tag = self._get_live_tag(tag_id)
+        if str(node["graph_id"]) != str(tag["graph_id"]):
+            raise ValueError("Node and tag must belong to the same graph.")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO node_tags(node_id, tag_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (node_id, tag_id, _utc_now()),
+            )
+
+    def remove_node_tag(self, node_id: str, tag_id: str) -> None:
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM node_tags WHERE node_id = ? AND tag_id = ?",
+                (node_id, tag_id),
+            )
+
+    def list_node_tags(self, node_id: str) -> list[Mapping[str, Any]]:
+        rows = self._connection.execute(
+            """
+            SELECT t.*
+            FROM tags t
+            INNER JOIN node_tags nt ON nt.tag_id = t.tag_id
+            WHERE nt.node_id = ? AND t.deleted_at IS NULL
+            ORDER BY t.name ASC
+            """,
+            (node_id,),
+        ).fetchall()
+        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
+
+    def create_group(self, graph_id: str, name: str) -> str:
+        self._require_live_graph(graph_id)
+        group_id = str(uuid4())
+        with self._connection:
+            try:
+                self._connection.execute(
+                    """
+                    INSERT INTO "groups"(group_id, graph_id, name, created_at, deleted_at)
+                    VALUES (?, ?, ?, ?, NULL)
+                    """,
+                    (group_id, graph_id, name, _utc_now()),
+                )
+            except sqlite3.IntegrityError as error:
+                raise ValueError(f"Group already exists in graph '{graph_id}': {name}") from error
+        return group_id
+
+    def list_groups(
+        self, graph_id: str, *, include_deleted: bool = False
+    ) -> list[Mapping[str, Any]]:
+        query = 'SELECT * FROM "groups" WHERE graph_id = ?'
+        params: tuple[Any, ...] = (graph_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        query += " ORDER BY name ASC"
+        rows = self._connection.execute(query, params).fetchall()
+        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
+
+    def delete_group(self, group_id: str, *, soft_delete: bool = True) -> None:
+        if soft_delete:
+            with self._connection:
+                self._connection.execute(
+                    'UPDATE "groups" SET deleted_at = ? WHERE group_id = ? AND deleted_at IS NULL',
+                    (_utc_now(), group_id),
+                )
+            return
+
+        with self._connection:
+            self._connection.execute('DELETE FROM "groups" WHERE group_id = ?', (group_id,))
+
+    def add_node_to_group(self, node_id: str, group_id: str) -> None:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        group = self._get_live_group(group_id)
+        if str(node["graph_id"]) != str(group["graph_id"]):
+            raise ValueError("Node and group must belong to the same graph.")
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT OR IGNORE INTO node_groups(node_id, group_id, created_at)
+                VALUES (?, ?, ?)
+                """,
+                (node_id, group_id, _utc_now()),
+            )
+
+    def remove_node_from_group(self, node_id: str, group_id: str) -> None:
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM node_groups WHERE node_id = ? AND group_id = ?",
+                (node_id, group_id),
+            )
+
+    def list_node_groups(self, node_id: str) -> list[Mapping[str, Any]]:
+        rows = self._connection.execute(
+            """
+            SELECT g.*
+            FROM "groups" g
+            INNER JOIN node_groups ng ON ng.group_id = g.group_id
+            WHERE ng.node_id = ? AND g.deleted_at IS NULL
+            ORDER BY g.name ASC
+            """,
+            (node_id,),
+        ).fetchall()
+        payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
+        return payload
+
+    def search_fulltext(
+        self,
+        query: str,
+        *,
+        graph_id: str | None = None,
+        group_id: str | None = None,
+        tag_ids: Sequence[str] | None = None,
+        limit: int = 20,
+    ) -> list[Mapping[str, Any]]:
+        fts_query = _build_fts_query(query)
+        if not fts_query or limit <= 0:
+            return []
+
+        sql_parts: list[str] = [
+            "SELECT n.*, bm25(node_search_fts) AS score",
+            "FROM node_search_fts",
+            "INNER JOIN nodes n ON n.node_id = node_search_fts.node_id",
+            "WHERE node_search_fts MATCH ?",
+            "AND n.deleted_at IS NULL",
+        ]
+        params: list[Any] = [fts_query]
+
+        if graph_id is not None:
+            sql_parts.append("AND n.graph_id = ?")
+            params.append(graph_id)
+        if group_id is not None:
+            sql_parts.append(
+                """
+                AND EXISTS (
+                    SELECT 1
+                    FROM node_groups ng
+                    INNER JOIN "groups" g ON g.group_id = ng.group_id
+                    WHERE ng.node_id = n.node_id
+                      AND ng.group_id = ?
+                      AND g.deleted_at IS NULL
+                )
+                """
+            )
+            params.append(group_id)
+        for tag_id in dict.fromkeys(tag_ids or []):
+            sql_parts.append(
+                """
+                AND EXISTS (
+                    SELECT 1
+                    FROM node_tags nt
+                    INNER JOIN tags t ON t.tag_id = nt.tag_id
+                    WHERE nt.node_id = n.node_id
+                      AND nt.tag_id = ?
+                      AND t.deleted_at IS NULL
+                )
+                """
+            )
+            params.append(tag_id)
+
+        sql_parts.append("ORDER BY score ASC, n.updated_at DESC LIMIT ?")
+        params.append(limit)
+
+        try:
+            rows = self._connection.execute("\n".join(sql_parts), tuple(params)).fetchall()
+        except sqlite3.OperationalError:
+            return []
+
+        payload: list[Mapping[str, Any]] = []
+        for row in rows:
+            item = _row_to_dict(row)
+            raw_score = row["score"]
+            item["score"] = float(raw_score) if raw_score is not None else 0.0
+            payload.append(item)
         return payload
 
     def _initialize_schema(self) -> None:
@@ -464,6 +703,7 @@ class SQLiteMetaStore:
                 deleted_at TEXT,
                 UNIQUE(graph_id, name)
             );
+            CREATE INDEX IF NOT EXISTS idx_tags_graph_id ON tags(graph_id);
 
             CREATE TABLE IF NOT EXISTS node_tags(
                 node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -471,6 +711,8 @@ class SQLiteMetaStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(node_id, tag_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_node_tags_node_id ON node_tags(node_id);
+            CREATE INDEX IF NOT EXISTS idx_node_tags_tag_id ON node_tags(tag_id);
 
             CREATE TABLE IF NOT EXISTS "groups"(
                 group_id TEXT PRIMARY KEY,
@@ -480,6 +722,7 @@ class SQLiteMetaStore:
                 deleted_at TEXT,
                 UNIQUE(graph_id, name)
             );
+            CREATE INDEX IF NOT EXISTS idx_groups_graph_id ON "groups"(graph_id);
 
             CREATE TABLE IF NOT EXISTS node_groups(
                 node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -487,6 +730,8 @@ class SQLiteMetaStore:
                 created_at TEXT NOT NULL,
                 PRIMARY KEY(node_id, group_id)
             );
+            CREATE INDEX IF NOT EXISTS idx_node_groups_node_id ON node_groups(node_id);
+            CREATE INDEX IF NOT EXISTS idx_node_groups_group_id ON node_groups(group_id);
 
             CREATE TABLE IF NOT EXISTS edges(
                 edge_id TEXT PRIMARY KEY,
@@ -520,6 +765,13 @@ class SQLiteMetaStore:
             CREATE INDEX IF NOT EXISTS idx_chunks_content_item_id ON chunks(content_item_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_node_id ON chunks(node_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at);
+
+            CREATE VIRTUAL TABLE IF NOT EXISTS node_search_fts USING fts5(
+                node_id UNINDEXED,
+                title,
+                body,
+                content_text
+            );
             """
         )
         self._ensure_content_item_columns()
@@ -527,10 +779,11 @@ class SQLiteMetaStore:
             self._connection.execute(
                 """
                 INSERT INTO schema_info(key, value)
-                VALUES ('schema_version', '2')
+                VALUES ('schema_version', '3')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
+        self._refresh_all_search_indexes()
 
     def _ensure_content_item_columns(self) -> None:
         rows = self._connection.execute("PRAGMA table_info(content_items)").fetchall()
@@ -555,6 +808,44 @@ class SQLiteMetaStore:
                 continue
             with self._connection:
                 self._connection.execute(statement)
+
+    def _refresh_node_search_index(self, node_id: str) -> None:
+        self._connection.execute("DELETE FROM node_search_fts WHERE node_id = ?", (node_id,))
+
+        node_row = self._connection.execute(
+            "SELECT node_id, title, body, deleted_at FROM nodes WHERE node_id = ?",
+            (node_id,),
+        ).fetchone()
+        if node_row is None or node_row["deleted_at"] is not None:
+            return
+
+        content_row = self._connection.execute(
+            """
+            SELECT COALESCE(GROUP_CONCAT(extracted_text, ' '), '') AS content_text
+            FROM content_items
+            WHERE node_id = ?
+              AND deleted_at IS NULL
+              AND extraction_status = 'done'
+            """,
+            (node_id,),
+        ).fetchone()
+        content_text = ""
+        if content_row is not None and content_row["content_text"] is not None:
+            content_text = str(content_row["content_text"])
+
+        self._connection.execute(
+            """
+            INSERT INTO node_search_fts(node_id, title, body, content_text)
+            VALUES (?, ?, ?, ?)
+            """,
+            (node_id, str(node_row["title"]), str(node_row["body"]), content_text),
+        )
+
+    def _refresh_all_search_indexes(self) -> None:
+        self._connection.execute("DELETE FROM node_search_fts")
+        rows = self._connection.execute("SELECT node_id FROM nodes").fetchall()
+        for row in rows:
+            self._refresh_node_search_index(str(row["node_id"]))
 
     def _insert_revision(
         self,
@@ -605,6 +896,24 @@ class SQLiteMetaStore:
         if node is None:
             raise KeyError(f"Node not found or deleted: {node_id}")
 
+    def _get_live_tag(self, tag_id: str) -> Mapping[str, Any]:
+        row = self._connection.execute(
+            "SELECT * FROM tags WHERE tag_id = ? AND deleted_at IS NULL",
+            (tag_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Tag not found or deleted: {tag_id}")
+        return _row_to_dict(row)
+
+    def _get_live_group(self, group_id: str) -> Mapping[str, Any]:
+        row = self._connection.execute(
+            'SELECT * FROM "groups" WHERE group_id = ? AND deleted_at IS NULL',
+            (group_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Group not found or deleted: {group_id}")
+        return _row_to_dict(row)
+
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {str(key): row[key] for key in row.keys()}
@@ -626,6 +935,15 @@ def _content_item_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             parsed_metadata = {}
     payload["extracted_metadata"] = parsed_metadata
     return payload
+
+
+def _build_fts_query(raw_query: str) -> str:
+    terms = [term.strip() for term in raw_query.split() if term.strip()]
+    if not terms:
+        return ""
+    escaped = [term.replace('"', '""') for term in terms]
+    quoted = [f'"{term}"' for term in escaped]
+    return " AND ".join(quoted)
 
 
 def _utc_now() -> str:
