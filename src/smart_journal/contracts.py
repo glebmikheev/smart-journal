@@ -130,6 +130,18 @@ class MetaStore(ProviderInfo, Protocol):
         self, content_item_id: str, *, include_deleted: bool = False
     ) -> list[Mapping[str, Any]]: ...
 
+    def upsert_chunk_embeddings(
+        self,
+        embeddings: Sequence[Mapping[str, Any]],
+    ) -> None: ...
+
+    def list_chunk_embeddings(
+        self,
+        content_item_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> list[Mapping[str, Any]]: ...
+
     def create_tag(self, graph_id: str, name: str) -> str: ...
 
     def list_tags(
