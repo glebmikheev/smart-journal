@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import struct
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
@@ -38,14 +39,14 @@ class SQLiteMetaStore:
         return "sqlite"
 
     def version(self) -> str:
-        return "0.4.0"
+        return "0.5.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": True,
             "fulltext_backend": "fts5",
             "durable": True,
-            "schema_version": 3,
+            "schema_version": 4,
             "supports_scope_filters": True,
         }
 
@@ -412,6 +413,113 @@ class SQLiteMetaStore:
         payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
         return payload
 
+    def upsert_chunk_embeddings(self, embeddings: Sequence[Mapping[str, Any]]) -> None:
+        if not embeddings:
+            return
+        with self._connection:
+            for embedding in embeddings:
+                chunk_id = str(embedding["chunk_id"])
+                model_id = str(embedding["model_id"])
+                metric = str(embedding.get("metric", "cosine"))
+                dim = int(embedding["dim"])
+
+                chunk_row = self._connection.execute(
+                    """
+                    SELECT checksum
+                    FROM chunks
+                    WHERE chunk_id = ? AND deleted_at IS NULL
+                    """,
+                    (chunk_id,),
+                ).fetchone()
+                if chunk_row is None:
+                    raise KeyError(f"Chunk not found or deleted: {chunk_id}")
+                chunk_checksum = str(chunk_row["checksum"])
+
+                checksum_raw = embedding.get("checksum")
+                checksum = chunk_checksum if checksum_raw is None else str(checksum_raw)
+                if checksum != chunk_checksum:
+                    raise ValueError(
+                        "Embedding checksum does not match chunk checksum "
+                        f"for chunk_id={chunk_id}."
+                    )
+
+                vector_raw = embedding.get("vector")
+                vector = _coerce_vector(vector_raw)
+                if len(vector) != dim:
+                    raise ValueError(
+                        f"Vector dim mismatch for chunk_id={chunk_id}: "
+                        f"expected {dim}, got {len(vector)}."
+                    )
+                vector_blob = _vector_to_blob(vector)
+
+                self._connection.execute(
+                    """
+                    INSERT INTO embeddings(
+                        chunk_id,
+                        model_id,
+                        dim,
+                        metric,
+                        vector_blob,
+                        checksum,
+                        created_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(chunk_id, model_id) DO UPDATE SET
+                        dim = excluded.dim,
+                        metric = excluded.metric,
+                        vector_blob = excluded.vector_blob,
+                        checksum = excluded.checksum,
+                        created_at = excluded.created_at
+                    """,
+                    (
+                        chunk_id,
+                        model_id,
+                        dim,
+                        metric,
+                        vector_blob,
+                        checksum,
+                        _utc_now(),
+                    ),
+                )
+
+    def list_chunk_embeddings(
+        self,
+        content_item_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        query = """
+            SELECT
+                e.chunk_id,
+                e.model_id,
+                e.dim,
+                e.metric,
+                e.vector_blob,
+                e.checksum,
+                e.created_at,
+                c.chunk_index
+            FROM embeddings e
+            INNER JOIN chunks c ON c.chunk_id = e.chunk_id
+            WHERE c.content_item_id = ?
+              AND c.deleted_at IS NULL
+        """
+        params: list[Any] = [content_item_id]
+        if model_id is not None:
+            query += "\nAND e.model_id = ?"
+            params.append(model_id)
+        query += "\nORDER BY c.chunk_index ASC, e.model_id ASC"
+
+        rows = self._connection.execute(query, tuple(params)).fetchall()
+        payload: list[Mapping[str, Any]] = []
+        for row in rows:
+            item = _row_to_dict(row)
+            item["dim"] = int(item["dim"])
+            item["vector"] = _blob_to_vector(bytes(row["vector_blob"]), int(item["dim"]))
+            item.pop("vector_blob", None)
+            item.pop("chunk_index", None)
+            payload.append(item)
+        return payload
+
     def create_tag(self, graph_id: str, name: str) -> str:
         self._require_live_graph(graph_id)
         tag_id = str(uuid4())
@@ -766,6 +874,20 @@ class SQLiteMetaStore:
             CREATE INDEX IF NOT EXISTS idx_chunks_node_id ON chunks(node_id);
             CREATE INDEX IF NOT EXISTS idx_chunks_deleted_at ON chunks(deleted_at);
 
+            CREATE TABLE IF NOT EXISTS embeddings(
+                chunk_id TEXT NOT NULL REFERENCES chunks(chunk_id) ON DELETE CASCADE,
+                model_id TEXT NOT NULL,
+                dim INTEGER NOT NULL,
+                metric TEXT NOT NULL,
+                vector_blob BLOB NOT NULL,
+                checksum TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(chunk_id, model_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_embeddings_chunk_id ON embeddings(chunk_id);
+            CREATE INDEX IF NOT EXISTS idx_embeddings_model_checksum
+                ON embeddings(model_id, checksum);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS node_search_fts USING fts5(
                 node_id UNINDEXED,
                 title,
@@ -779,7 +901,7 @@ class SQLiteMetaStore:
             self._connection.execute(
                 """
                 INSERT INTO schema_info(key, value)
-                VALUES ('schema_version', '3')
+                VALUES ('schema_version', '4')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )
@@ -935,6 +1057,25 @@ def _content_item_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             parsed_metadata = {}
     payload["extracted_metadata"] = parsed_metadata
     return payload
+
+
+def _coerce_vector(raw: Any) -> list[float]:
+    if isinstance(raw, Sequence) and not isinstance(raw, str | bytes | bytearray):
+        return [float(value) for value in raw]
+    raise TypeError("Embedding vector must be a sequence of floats.")
+
+
+def _vector_to_blob(vector: Sequence[float]) -> bytes:
+    return struct.pack(f"<{len(vector)}f", *vector)
+
+
+def _blob_to_vector(blob: bytes, dim: int) -> list[float]:
+    expected_size = dim * struct.calcsize("<f")
+    if len(blob) != expected_size:
+        raise ValueError(
+            f"Invalid vector blob size: expected {expected_size} bytes, got {len(blob)}."
+        )
+    return [float(value) for value in struct.unpack(f"<{dim}f", blob)]
 
 
 def _build_fts_query(raw_query: str) -> str:
