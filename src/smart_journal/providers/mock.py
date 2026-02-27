@@ -65,6 +65,7 @@ class InMemoryMetaStore:
         self._revisions_by_node: dict[str, list[dict[str, Any]]] = {}
         self._content_items: dict[str, dict[str, Any]] = {}
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
+        self._chunk_embeddings: dict[tuple[str, str], dict[str, Any]] = {}
         self._tags: dict[str, dict[str, Any]] = {}
         self._groups: dict[str, dict[str, Any]] = {}
         self._node_tags: dict[str, set[str]] = {}
@@ -74,14 +75,14 @@ class InMemoryMetaStore:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.4.0"
+        return "0.5.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": False,
             "fulltext_backend": "naive",
             "durable": False,
-            "schema_version": 3,
+            "schema_version": 4,
             "supports_scope_filters": True,
         }
 
@@ -185,7 +186,10 @@ class InMemoryMetaStore:
         for content_item_id, item in list(self._content_items.items()):
             if item["node_id"] == node_id:
                 self._content_items.pop(content_item_id, None)
-                self._chunks_by_content_item.pop(content_item_id, None)
+                removed_chunks = self._chunks_by_content_item.pop(content_item_id, [])
+                self._delete_embeddings_for_chunks(
+                    [str(chunk["chunk_id"]) for chunk in removed_chunks]
+                )
 
     def list_nodes(
         self, graph_id: str, *, include_deleted: bool = False
@@ -266,10 +270,15 @@ class InMemoryMetaStore:
         if item is None:
             return
         if soft_delete:
-            item["deleted_at"] = _utc_now()
+            deleted_at = _utc_now()
+            item["deleted_at"] = deleted_at
+            for chunk in self._chunks_by_content_item.get(content_item_id, []):
+                if chunk["deleted_at"] is None:
+                    chunk["deleted_at"] = deleted_at
             return
         self._content_items.pop(content_item_id, None)
-        self._chunks_by_content_item.pop(content_item_id, None)
+        removed_chunks = self._chunks_by_content_item.pop(content_item_id, [])
+        self._delete_embeddings_for_chunks([str(chunk["chunk_id"]) for chunk in removed_chunks])
 
     def set_content_item_extraction(
         self,
@@ -299,6 +308,7 @@ class InMemoryMetaStore:
         if item is None or item["deleted_at"] is not None:
             raise KeyError(f"Content item not found or deleted: {content_item_id}")
         created_chunk_ids: list[str] = []
+        existing_rows = self._chunks_by_content_item.get(content_item_id, [])
         new_rows: list[dict[str, Any]] = []
         for chunk in chunks:
             chunk_id = str(uuid4())
@@ -315,6 +325,7 @@ class InMemoryMetaStore:
                     "deleted_at": None,
                 }
             )
+        self._delete_embeddings_for_chunks([str(row["chunk_id"]) for row in existing_rows])
         self._chunks_by_content_item[content_item_id] = new_rows
         return created_chunk_ids
 
@@ -329,6 +340,82 @@ class InMemoryMetaStore:
         ]
         payload.sort(key=lambda chunk: int(chunk["chunk_index"]))
         return payload
+
+    def upsert_chunk_embeddings(self, embeddings: Sequence[Mapping[str, Any]]) -> None:
+        for embedding in embeddings:
+            chunk_id = str(embedding["chunk_id"])
+            model_id = str(embedding["model_id"])
+            dim = int(embedding["dim"])
+            metric = str(embedding.get("metric", "cosine"))
+            vector = _coerce_vector(embedding.get("vector"))
+            if len(vector) != dim:
+                raise ValueError(
+                    f"Vector dim mismatch for chunk_id={chunk_id}: "
+                    f"expected {dim}, got {len(vector)}."
+                )
+            chunk = self._get_live_chunk(chunk_id)
+            checksum_raw = embedding.get("checksum")
+            checksum = str(chunk["checksum"]) if checksum_raw is None else str(checksum_raw)
+            if checksum != str(chunk["checksum"]):
+                raise ValueError(
+                    "Embedding checksum does not match chunk checksum "
+                    f"for chunk_id={chunk_id}."
+                )
+            self._chunk_embeddings[(chunk_id, model_id)] = {
+                "chunk_id": chunk_id,
+                "model_id": model_id,
+                "dim": dim,
+                "metric": metric,
+                "vector": vector,
+                "checksum": checksum,
+                "created_at": _utc_now(),
+            }
+
+    def list_chunk_embeddings(
+        self,
+        content_item_id: str,
+        *,
+        model_id: str | None = None,
+    ) -> list[Mapping[str, Any]]:
+        chunk_by_id = {
+            str(chunk["chunk_id"]): chunk
+            for chunk in self._chunks_by_content_item.get(content_item_id, [])
+            if chunk["deleted_at"] is None
+        }
+        payload: list[dict[str, Any]] = []
+        for row in self._chunk_embeddings.values():
+            chunk_id = str(row["chunk_id"])
+            chunk = chunk_by_id.get(chunk_id)
+            if chunk is None:
+                continue
+            if model_id is not None and str(row["model_id"]) != model_id:
+                continue
+            payload.append(
+                {
+                    "chunk_id": chunk_id,
+                    "model_id": str(row["model_id"]),
+                    "dim": int(row["dim"]),
+                    "metric": str(row["metric"]),
+                    "vector": [float(value) for value in row["vector"]],
+                    "checksum": str(row["checksum"]),
+                    "created_at": str(row["created_at"]),
+                    "_chunk_index": int(chunk["chunk_index"]),
+                }
+            )
+        payload.sort(key=lambda row: (int(row["_chunk_index"]), str(row["model_id"])))
+        result: list[Mapping[str, Any]] = [
+            {
+                "chunk_id": str(row["chunk_id"]),
+                "model_id": str(row["model_id"]),
+                "dim": int(row["dim"]),
+                "metric": str(row["metric"]),
+                "vector": [float(value) for value in row["vector"]],
+                "checksum": str(row["checksum"]),
+                "created_at": str(row["created_at"]),
+            }
+            for row in payload
+        ]
+        return result
 
     def create_tag(self, graph_id: str, name: str) -> str:
         if self.get_graph(graph_id) is None:
@@ -511,6 +598,24 @@ class InMemoryMetaStore:
         if group is None or group["deleted_at"] is not None:
             raise KeyError(f"Group not found or deleted: {group_id}")
         return group
+
+    def _get_live_chunk(self, chunk_id: str) -> Mapping[str, Any]:
+        for chunks in self._chunks_by_content_item.values():
+            for chunk in chunks:
+                if str(chunk["chunk_id"]) != chunk_id:
+                    continue
+                if chunk["deleted_at"] is not None:
+                    raise KeyError(f"Chunk not found or deleted: {chunk_id}")
+                return chunk
+        raise KeyError(f"Chunk not found or deleted: {chunk_id}")
+
+    def _delete_embeddings_for_chunks(self, chunk_ids: Sequence[str]) -> None:
+        if not chunk_ids:
+            return
+        chunk_id_set = {str(chunk_id) for chunk_id in chunk_ids}
+        for key in list(self._chunk_embeddings):
+            if key[0] in chunk_id_set:
+                self._chunk_embeddings.pop(key, None)
 
 
 class InMemoryVectorIndex:
@@ -818,6 +923,12 @@ class MockLLMProvider:
             return "mock_chat: no messages"
         last = messages[-1].get("content", "")
         return f"mock_chat: {last[:120]}"
+
+
+def _coerce_vector(raw: Any) -> list[float]:
+    if isinstance(raw, Sequence) and not isinstance(raw, str | bytes | bytearray):
+        return [float(value) for value in raw]
+    raise TypeError("Embedding vector must be a sequence of floats.")
 
 
 def _cosine_similarity(lhs: Sequence[float], rhs: Sequence[float]) -> float:
