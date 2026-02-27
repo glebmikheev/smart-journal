@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 
-from smart_journal.contracts import BlobRef, BlobStore, Extractor, JobQueue, MetaStore
+from smart_journal.contracts import (
+    BlobRef,
+    BlobStore,
+    EmbeddingProvider,
+    Extractor,
+    JobQueue,
+    MetaStore,
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -13,6 +20,13 @@ class ChunkDraft:
     chunk_index: int
     text: str
     checksum: str
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingSyncStats:
+    total_chunks: int
+    reused_chunks: int
+    computed_chunks: int
 
 
 def split_text_into_chunks(
@@ -59,6 +73,8 @@ class IngestionPipeline:
         blob_store: BlobStore,
         extractor: Extractor,
         job_queue: JobQueue,
+        embedding_provider: EmbeddingProvider | None = None,
+        embedding_metric: str = "cosine",
         chunk_size: int = 500,
         chunk_overlap: int = 80,
     ) -> None:
@@ -66,6 +82,8 @@ class IngestionPipeline:
         self._blob_store = blob_store
         self._extractor = extractor
         self._job_queue = job_queue
+        self._embedding_provider = embedding_provider
+        self._embedding_metric = embedding_metric
         self._chunk_size = chunk_size
         self._chunk_overlap = chunk_overlap
 
@@ -121,6 +139,34 @@ class IngestionPipeline:
         self._meta_store.set_content_item_extraction(content_item_id, status="running")
         try:
             artifact = self._extractor.extract(blob_payload, mime_type=mime_type)
+            previous_embeddings_by_checksum = self._snapshot_embeddings_by_checksum(content_item_id)
+
+            extracted_text = artifact.text or ""
+            chunk_drafts = split_text_into_chunks(
+                extracted_text,
+                chunk_size=self._chunk_size,
+                chunk_overlap=self._chunk_overlap,
+            )
+            chunk_rows: list[dict[str, str | int]] = [
+                {
+                    "chunk_index": draft.chunk_index,
+                    "text": draft.text,
+                    "checksum": draft.checksum,
+                }
+                for draft in chunk_drafts
+            ]
+            self._meta_store.replace_content_item_chunks(content_item_id, chunk_rows)
+            self._sync_text_embeddings(
+                content_item_id,
+                cached_vectors_by_checksum=previous_embeddings_by_checksum,
+            )
+            self._meta_store.set_content_item_extraction(
+                content_item_id,
+                status="done",
+                extracted_text=extracted_text,
+                metadata=(artifact.metadata or {}),
+                error=None,
+            )
         except Exception as error:  # noqa: BLE001
             self._meta_store.set_content_item_extraction(
                 content_item_id,
@@ -130,28 +176,106 @@ class IngestionPipeline:
             self._meta_store.replace_content_item_chunks(content_item_id, [])
             raise
 
-        extracted_text = artifact.text or ""
-        chunk_drafts = split_text_into_chunks(
-            extracted_text,
-            chunk_size=self._chunk_size,
-            chunk_overlap=self._chunk_overlap,
+    def _snapshot_embeddings_by_checksum(self, content_item_id: str) -> dict[str, list[float]]:
+        if self._embedding_provider is None:
+            return {}
+        model_id = self._embedding_provider.model_id()
+        expected_dim = self._embedding_provider.dim()
+        rows = self._meta_store.list_chunk_embeddings(content_item_id, model_id=model_id)
+        payload: dict[str, list[float]] = {}
+        for row in rows:
+            checksum = str(row["checksum"])
+            if checksum in payload:
+                continue
+            vector = _coerce_vector(row.get("vector"))
+            if len(vector) != expected_dim:
+                continue
+            payload[checksum] = vector
+        return payload
+
+    def _sync_text_embeddings(
+        self,
+        content_item_id: str,
+        *,
+        cached_vectors_by_checksum: Mapping[str, Sequence[float]] | None = None,
+    ) -> EmbeddingSyncStats:
+        if self._embedding_provider is None:
+            return EmbeddingSyncStats(total_chunks=0, reused_chunks=0, computed_chunks=0)
+
+        model_id = self._embedding_provider.model_id()
+        expected_dim = self._embedding_provider.dim()
+        current_chunks = self._meta_store.list_chunks(content_item_id)
+        if not current_chunks:
+            return EmbeddingSyncStats(total_chunks=0, reused_chunks=0, computed_chunks=0)
+
+        cache: dict[str, list[float]] = {
+            str(checksum): [float(value) for value in vector]
+            for checksum, vector in (cached_vectors_by_checksum or {}).items()
+        }
+
+        embeddings_to_upsert: list[dict[str, Any]] = []
+        pending_chunks: list[tuple[str, str, str]] = []
+        reused_chunks = 0
+        for chunk in current_chunks:
+            checksum = str(chunk["checksum"])
+            cached_vector = cache.get(checksum)
+            if cached_vector is None:
+                pending_chunks.append((str(chunk["chunk_id"]), str(chunk["text"]), checksum))
+                continue
+            if len(cached_vector) != expected_dim:
+                pending_chunks.append((str(chunk["chunk_id"]), str(chunk["text"]), checksum))
+                continue
+            reused_chunks += 1
+            embeddings_to_upsert.append(
+                {
+                    "chunk_id": str(chunk["chunk_id"]),
+                    "model_id": model_id,
+                    "dim": expected_dim,
+                    "metric": self._embedding_metric,
+                    "vector": list(cached_vector),
+                    "checksum": checksum,
+                }
+            )
+
+        computed_chunks = 0
+        if pending_chunks:
+            vectors = self._embedding_provider.embed_text([row[1] for row in pending_chunks])
+            if len(vectors) != len(pending_chunks):
+                raise ValueError(
+                    "EmbeddingProvider returned unexpected vector count: "
+                    f"expected {len(pending_chunks)}, got {len(vectors)}."
+                )
+            for (chunk_id, _, checksum), raw_vector in zip(pending_chunks, vectors, strict=True):
+                vector = _coerce_vector(raw_vector)
+                if len(vector) != expected_dim:
+                    raise ValueError(
+                        f"Embedding dim mismatch for chunk_id={chunk_id}: "
+                        f"expected {expected_dim}, got {len(vector)}."
+                    )
+                embeddings_to_upsert.append(
+                    {
+                        "chunk_id": chunk_id,
+                        "model_id": model_id,
+                        "dim": expected_dim,
+                        "metric": self._embedding_metric,
+                        "vector": vector,
+                        "checksum": checksum,
+                    }
+                )
+                computed_chunks += 1
+
+        self._meta_store.upsert_chunk_embeddings(embeddings_to_upsert)
+        return EmbeddingSyncStats(
+            total_chunks=len(current_chunks),
+            reused_chunks=reused_chunks,
+            computed_chunks=computed_chunks,
         )
-        chunk_rows: list[dict[str, str | int]] = [
-            {
-                "chunk_index": draft.chunk_index,
-                "text": draft.text,
-                "checksum": draft.checksum,
-            }
-            for draft in chunk_drafts
-        ]
-        self._meta_store.replace_content_item_chunks(content_item_id, chunk_rows)
-        self._meta_store.set_content_item_extraction(
-            content_item_id,
-            status="done",
-            extracted_text=extracted_text,
-            metadata=(artifact.metadata or {}),
-            error=None,
-        )
+
+
+def _coerce_vector(raw: Any) -> list[float]:
+    if isinstance(raw, Sequence) and not isinstance(raw, str | bytes | bytearray):
+        return [float(value) for value in raw]
+    raise TypeError("Embedding vector must be a sequence of floats.")
 
 
 def build_default_ingestion_pipeline(
@@ -160,16 +284,20 @@ def build_default_ingestion_pipeline(
     blob_store: BlobStore,
     extractor: Extractor,
     job_queue: JobQueue,
+    embedding_provider: EmbeddingProvider | None = None,
     options: Mapping[str, Any] | None = None,
 ) -> IngestionPipeline:
     options = options or {}
     chunk_size = int(options.get("chunk_size", 500))
     chunk_overlap = int(options.get("chunk_overlap", 80))
+    embedding_metric = str(options.get("embedding_metric", "cosine"))
     return IngestionPipeline(
         meta_store=meta_store,
         blob_store=blob_store,
         extractor=extractor,
         job_queue=job_queue,
+        embedding_provider=embedding_provider,
+        embedding_metric=embedding_metric,
         chunk_size=chunk_size,
         chunk_overlap=chunk_overlap,
     )
