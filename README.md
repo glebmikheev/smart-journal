@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 3 baseline for the Smart Journal knowledge base.
+Increment 4 baseline for the Smart Journal knowledge base.
 
 ## What is implemented
 
@@ -8,11 +8,12 @@ Increment 3 baseline for the Smart Journal knowledge base.
 - contract definitions for:
   - `BlobStore`, `MetaStore`, `VectorIndex`, `JobQueue`
   - `Extractor`, `EmbeddingProvider`, `LLMProvider`
-- SQLite `MetaStore` schema v1 with base tables:
+- SQLite `MetaStore` schema v4 with base tables:
   - `nodes`, `revisions`, `content_items`, `tags`, `groups`, `edges` (+ join tables)
 - ingestion extensions in MetaStore:
   - extraction status/text for `content_items`
   - `chunks` table with checksum per text chunk
+  - `embeddings` table with vector BLOBs per `chunk_id` + `model_id`
 - local filesystem `BlobStore` with SHA-256 content-addressed storage
 - node CRUD + revisions + file attach/detach metadata
 - in-process `JobQueue` with explicit statuses: `queued/running/completed/failed`
@@ -22,6 +23,7 @@ Increment 3 baseline for the Smart Journal knowledge base.
   - image -> thumbnail metadata (no OCR)
   - audio/video -> metadata-only (alpha)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
+- incremental embedding sync by chunk checksum (recompute only changed chunks)
 - FTS5 full-text search index in SQLite meta store
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
