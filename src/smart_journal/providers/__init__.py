@@ -10,6 +10,7 @@ from .mock import (
     PlainTextExtractor,
 )
 from .sqlite_meta import SQLiteMetaStore
+from .usearch_file import USearchFileVectorIndex
 
 __all__ = [
     "BasicExtractorV1",
@@ -22,4 +23,5 @@ __all__ = [
     "MockLLMProvider",
     "PlainTextExtractor",
     "SQLiteMetaStore",
+    "USearchFileVectorIndex",
 ]

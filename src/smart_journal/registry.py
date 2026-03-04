@@ -16,6 +16,7 @@ from smart_journal.providers import (
     MockLLMProvider,
     PlainTextExtractor,
     SQLiteMetaStore,
+    USearchFileVectorIndex,
 )
 
 ProviderConstructor = Callable[[Mapping[str, Any]], ProviderInfo]
@@ -118,6 +119,11 @@ def build_default_registry() -> ProviderRegistry:
         category="vector_index",
         provider_id="in_memory",
         constructor=lambda options: InMemoryVectorIndex(options),
+    )
+    registry.register(
+        category="vector_index",
+        provider_id="usearch_file",
+        constructor=lambda options: USearchFileVectorIndex(options),
     )
     registry.register(
         category="job_queue",
