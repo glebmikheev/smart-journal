@@ -27,6 +27,8 @@ class EmbeddingSyncStats:
     total_chunks: int
     reused_chunks: int
     computed_chunks: int
+    model_id: str | None = None
+    upserted_chunk_ids: tuple[str, ...] = ()
 
 
 def split_text_into_chunks(
@@ -139,6 +141,9 @@ class IngestionPipeline:
         self._meta_store.set_content_item_extraction(content_item_id, status="running")
         try:
             artifact = self._extractor.extract(blob_payload, mime_type=mime_type)
+            previous_chunk_ids = {
+                str(row["chunk_id"]) for row in self._meta_store.list_chunks(content_item_id)
+            }
             previous_embeddings_by_checksum = self._snapshot_embeddings_by_checksum(content_item_id)
 
             extracted_text = artifact.text or ""
@@ -156,9 +161,13 @@ class IngestionPipeline:
                 for draft in chunk_drafts
             ]
             self._meta_store.replace_content_item_chunks(content_item_id, chunk_rows)
-            self._sync_text_embeddings(
+            embedding_sync_stats = self._sync_text_embeddings(
                 content_item_id,
                 cached_vectors_by_checksum=previous_embeddings_by_checksum,
+            )
+            self._enqueue_vector_index_ops(
+                previous_chunk_ids=previous_chunk_ids,
+                sync_stats=embedding_sync_stats,
             )
             self._meta_store.set_content_item_extraction(
                 content_item_id,
@@ -200,13 +209,25 @@ class IngestionPipeline:
         cached_vectors_by_checksum: Mapping[str, Sequence[float]] | None = None,
     ) -> EmbeddingSyncStats:
         if self._embedding_provider is None:
-            return EmbeddingSyncStats(total_chunks=0, reused_chunks=0, computed_chunks=0)
+            return EmbeddingSyncStats(
+                total_chunks=0,
+                reused_chunks=0,
+                computed_chunks=0,
+                model_id=None,
+                upserted_chunk_ids=(),
+            )
 
         model_id = self._embedding_provider.model_id()
         expected_dim = self._embedding_provider.dim()
         current_chunks = self._meta_store.list_chunks(content_item_id)
         if not current_chunks:
-            return EmbeddingSyncStats(total_chunks=0, reused_chunks=0, computed_chunks=0)
+            return EmbeddingSyncStats(
+                total_chunks=0,
+                reused_chunks=0,
+                computed_chunks=0,
+                model_id=model_id,
+                upserted_chunk_ids=(),
+            )
 
         cache: dict[str, list[float]] = {
             str(checksum): [float(value) for value in vector]
@@ -265,11 +286,45 @@ class IngestionPipeline:
                 computed_chunks += 1
 
         self._meta_store.upsert_chunk_embeddings(embeddings_to_upsert)
+        upserted_chunk_ids = tuple(str(row["chunk_id"]) for row in embeddings_to_upsert)
         return EmbeddingSyncStats(
             total_chunks=len(current_chunks),
             reused_chunks=reused_chunks,
             computed_chunks=computed_chunks,
+            model_id=model_id,
+            upserted_chunk_ids=upserted_chunk_ids,
         )
+
+    def _enqueue_vector_index_ops(
+        self,
+        *,
+        previous_chunk_ids: set[str],
+        sync_stats: EmbeddingSyncStats,
+    ) -> None:
+        model_id = sync_stats.model_id
+        if model_id is None:
+            return
+
+        upsert_ids = {str(chunk_id) for chunk_id in sync_stats.upserted_chunk_ids}
+        delete_ids = previous_chunk_ids - upsert_ids
+        ops: list[dict[str, str]] = [
+            {
+                "op_type": "upsert",
+                "chunk_id": chunk_id,
+                "model_id": model_id,
+            }
+            for chunk_id in sorted(upsert_ids)
+        ]
+        ops.extend(
+            {
+                "op_type": "delete",
+                "chunk_id": chunk_id,
+                "model_id": model_id,
+            }
+            for chunk_id in sorted(delete_ids)
+        )
+        if ops:
+            self._meta_store.enqueue_vector_index_ops(ops)
 
 
 def _coerce_vector(raw: Any) -> list[float]:
