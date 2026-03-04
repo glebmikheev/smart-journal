@@ -39,14 +39,14 @@ class SQLiteMetaStore:
         return "sqlite"
 
     def version(self) -> str:
-        return "0.5.0"
+        return "0.6.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": True,
             "fulltext_backend": "fts5",
             "durable": True,
-            "schema_version": 4,
+            "schema_version": 5,
             "supports_scope_filters": True,
         }
 
@@ -520,6 +520,105 @@ class SQLiteMetaStore:
             payload.append(item)
         return payload
 
+    def get_chunk_embedding(
+        self,
+        chunk_id: str,
+        model_id: str,
+    ) -> Mapping[str, Any] | None:
+        row = self._connection.execute(
+            """
+            SELECT chunk_id, model_id, dim, metric, vector_blob, checksum, created_at
+            FROM embeddings
+            WHERE chunk_id = ? AND model_id = ?
+            """,
+            (chunk_id, model_id),
+        ).fetchone()
+        if row is None:
+            return None
+        item = _row_to_dict(row)
+        item["dim"] = int(item["dim"])
+        item["vector"] = _blob_to_vector(bytes(row["vector_blob"]), int(item["dim"]))
+        item.pop("vector_blob", None)
+        return item
+
+    def enqueue_vector_index_ops(
+        self,
+        ops: Sequence[Mapping[str, str]],
+    ) -> list[str]:
+        if not ops:
+            return []
+        created_ids: list[str] = []
+        with self._connection:
+            for op in ops:
+                op_type = str(op["op_type"])
+                if op_type not in {"upsert", "delete"}:
+                    raise ValueError(f"Unsupported vector index op_type: {op_type}")
+                op_id = str(uuid4())
+                created_ids.append(op_id)
+                self._connection.execute(
+                    """
+                    INSERT INTO vector_index_ops(
+                        op_id,
+                        op_type,
+                        chunk_id,
+                        model_id,
+                        status,
+                        created_at,
+                        applied_at
+                    )
+                    VALUES (?, ?, ?, ?, 'pending', ?, NULL)
+                    """,
+                    (
+                        op_id,
+                        op_type,
+                        str(op["chunk_id"]),
+                        str(op["model_id"]),
+                        _utc_now(),
+                    ),
+                )
+        return created_ids
+
+    def list_vector_index_ops(
+        self,
+        *,
+        status: str = "pending",
+        model_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            return []
+        query = """
+            SELECT op_id, op_type, chunk_id, model_id, status, created_at, applied_at
+            FROM vector_index_ops
+            WHERE status = ?
+        """
+        params: list[Any] = [status]
+        if model_id is not None:
+            query += "\nAND model_id = ?"
+            params.append(model_id)
+        query += "\nORDER BY created_at ASC, op_id ASC LIMIT ?"
+        params.append(limit)
+
+        rows = self._connection.execute(query, tuple(params)).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def mark_vector_index_ops_applied(self, op_ids: Sequence[str]) -> None:
+        unique_ids = list(dict.fromkeys(str(op_id) for op_id in op_ids if str(op_id)))
+        if not unique_ids:
+            return
+
+        placeholders = ", ".join("?" for _ in unique_ids)
+        with self._connection:
+            self._connection.execute(
+                f"""
+                UPDATE vector_index_ops
+                SET status = 'applied',
+                    applied_at = ?
+                WHERE op_id IN ({placeholders})
+                """,
+                (_utc_now(), *unique_ids),
+            )
+
     def create_tag(self, graph_id: str, name: str) -> str:
         self._require_live_graph(graph_id)
         tag_id = str(uuid4())
@@ -888,6 +987,22 @@ class SQLiteMetaStore:
             CREATE INDEX IF NOT EXISTS idx_embeddings_model_checksum
                 ON embeddings(model_id, checksum);
 
+            CREATE TABLE IF NOT EXISTS vector_index_ops(
+                op_id TEXT PRIMARY KEY,
+                op_type TEXT NOT NULL,
+                chunk_id TEXT NOT NULL,
+                model_id TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending',
+                created_at TEXT NOT NULL,
+                applied_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_vector_index_ops_status
+                ON vector_index_ops(status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_vector_index_ops_model_status
+                ON vector_index_ops(model_id, status, created_at);
+            CREATE INDEX IF NOT EXISTS idx_vector_index_ops_chunk_id
+                ON vector_index_ops(chunk_id);
+
             CREATE VIRTUAL TABLE IF NOT EXISTS node_search_fts USING fts5(
                 node_id UNINDEXED,
                 title,
@@ -901,7 +1016,7 @@ class SQLiteMetaStore:
             self._connection.execute(
                 """
                 INSERT INTO schema_info(key, value)
-                VALUES ('schema_version', '4')
+                VALUES ('schema_version', '5')
                 ON CONFLICT(key) DO UPDATE SET value = excluded.value
                 """
             )

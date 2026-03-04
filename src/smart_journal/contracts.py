@@ -142,6 +142,27 @@ class MetaStore(ProviderInfo, Protocol):
         model_id: str | None = None,
     ) -> list[Mapping[str, Any]]: ...
 
+    def get_chunk_embedding(
+        self,
+        chunk_id: str,
+        model_id: str,
+    ) -> Mapping[str, Any] | None: ...
+
+    def enqueue_vector_index_ops(
+        self,
+        ops: Sequence[Mapping[str, str]],
+    ) -> list[str]: ...
+
+    def list_vector_index_ops(
+        self,
+        *,
+        status: str = "pending",
+        model_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, Any]]: ...
+
+    def mark_vector_index_ops_applied(self, op_ids: Sequence[str]) -> None: ...
+
     def create_tag(self, graph_id: str, name: str) -> str: ...
 
     def list_tags(

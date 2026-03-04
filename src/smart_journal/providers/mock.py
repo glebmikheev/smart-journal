@@ -66,6 +66,7 @@ class InMemoryMetaStore:
         self._content_items: dict[str, dict[str, Any]] = {}
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
         self._chunk_embeddings: dict[tuple[str, str], dict[str, Any]] = {}
+        self._vector_index_ops: dict[str, dict[str, Any]] = {}
         self._tags: dict[str, dict[str, Any]] = {}
         self._groups: dict[str, dict[str, Any]] = {}
         self._node_tags: dict[str, set[str]] = {}
@@ -75,14 +76,14 @@ class InMemoryMetaStore:
         return "in_memory"
 
     def version(self) -> str:
-        return "0.5.0"
+        return "0.6.0"
 
     def capabilities(self) -> Mapping[str, bool | int | float | str | list[str]]:
         return {
             "transactions": False,
             "fulltext_backend": "naive",
             "durable": False,
-            "schema_version": 4,
+            "schema_version": 5,
             "supports_scope_filters": True,
         }
 
@@ -416,6 +417,83 @@ class InMemoryMetaStore:
             for row in payload
         ]
         return result
+
+    def get_chunk_embedding(
+        self,
+        chunk_id: str,
+        model_id: str,
+    ) -> Mapping[str, Any] | None:
+        row = self._chunk_embeddings.get((chunk_id, model_id))
+        if row is None:
+            return None
+        try:
+            chunk = self._get_live_chunk(chunk_id)
+        except KeyError:
+            return None
+        return {
+            "chunk_id": str(row["chunk_id"]),
+            "model_id": str(row["model_id"]),
+            "dim": int(row["dim"]),
+            "metric": str(row["metric"]),
+            "vector": [float(value) for value in row["vector"]],
+            "checksum": str(chunk["checksum"]),
+            "created_at": str(row["created_at"]),
+        }
+
+    def enqueue_vector_index_ops(
+        self,
+        ops: Sequence[Mapping[str, str]],
+    ) -> list[str]:
+        created_ids: list[str] = []
+        for op in ops:
+            op_type = str(op["op_type"])
+            if op_type not in {"upsert", "delete"}:
+                raise ValueError(f"Unsupported vector index op_type: {op_type}")
+            op_id = str(uuid4())
+            created_ids.append(op_id)
+            timestamp = _utc_now()
+            self._vector_index_ops[op_id] = {
+                "op_id": op_id,
+                "op_type": op_type,
+                "chunk_id": str(op["chunk_id"]),
+                "model_id": str(op["model_id"]),
+                "status": "pending",
+                "created_at": timestamp,
+                "applied_at": None,
+            }
+        return created_ids
+
+    def list_vector_index_ops(
+        self,
+        *,
+        status: str = "pending",
+        model_id: str | None = None,
+        limit: int = 1000,
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            return []
+        rows = [
+            dict(row)
+            for row in self._vector_index_ops.values()
+            if str(row["status"]) == status
+            and (model_id is None or str(row["model_id"]) == model_id)
+        ]
+        rows.sort(key=lambda row: (str(row["created_at"]), str(row["op_id"])))
+        result: list[Mapping[str, Any]] = []
+        for row in rows[:limit]:
+            result.append(row)
+        return result
+
+    def mark_vector_index_ops_applied(self, op_ids: Sequence[str]) -> None:
+        if not op_ids:
+            return
+        timestamp = _utc_now()
+        for op_id in op_ids:
+            row = self._vector_index_ops.get(op_id)
+            if row is None:
+                continue
+            row["status"] = "applied"
+            row["applied_at"] = timestamp
 
     def create_tag(self, graph_id: str, name: str) -> str:
         if self.get_graph(graph_id) is None:
