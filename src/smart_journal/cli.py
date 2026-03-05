@@ -14,12 +14,13 @@ from smart_journal.registry import (
     ProviderRegistry,
     build_default_registry,
 )
+from smart_journal.vector_ops import VectorIndexOpsReplayer
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="smart-journal",
-        description="Smart Journal increment 4 CLI.",
+        description="Smart Journal increment 5 CLI.",
     )
     parser.add_argument(
         "--config",
@@ -63,6 +64,7 @@ def run_cli(argv: list[str] | None = None) -> int:
         config = load_config(args.config)
         bundle = ComponentFactory(registry).create(config)
         try:
+            _bootstrap_vector_index(bundle)
             selected_payload = _selected_providers_payload(bundle)
             if args.as_json:
                 print(json.dumps(selected_payload, indent=2, ensure_ascii=False))
@@ -146,6 +148,16 @@ def _close_bundle_resources(bundle: ComponentBundle) -> None:
         closer = getattr(provider, "close", None)
         if callable(closer):
             closer()
+
+
+def _bootstrap_vector_index(bundle: ComponentBundle) -> None:
+    bundle.vector_index.load()
+    replayer = VectorIndexOpsReplayer(
+        meta_store=bundle.meta_store,
+        vector_index=bundle.vector_index,
+        model_id=bundle.embedding_provider.model_id(),
+    )
+    replayer.replay_pending()
 
 
 if __name__ == "__main__":
