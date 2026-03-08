@@ -25,6 +25,7 @@ Increment 5 baseline for the Smart Journal knowledge base.
   - audio/video -> metadata-only (alpha)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
 - incremental embedding sync by chunk checksum (recompute only changed chunks)
+- real embedding backend `multilingual_e5_small` (Sentence Transformers)
 - file-backed `usearch_file` VectorIndex (`indexes/.../usearch.index` + `manifest.json`)
 - replay of pending `vector_index_ops` at startup (`smart-journal run`)
 - FTS5 full-text search index in SQLite meta store
@@ -74,7 +75,10 @@ backend = "in_process"
 backend = "basic_v1"
 
 [embedding_provider]
-backend = "mock_text"
+backend = "multilingual_e5_small"
+device = "cpu"
+text_prefix = "passage"
+batch_size = 32
 
 [llm_provider]
 backend = "mock_chat"

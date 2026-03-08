@@ -39,7 +39,14 @@ class AppConfig:
         default_factory=lambda: ComponentConfig(backend="basic_v1")
     )
     embedding_provider: ComponentConfig = field(
-        default_factory=lambda: ComponentConfig(backend="mock_text")
+        default_factory=lambda: ComponentConfig(
+            backend="multilingual_e5_small",
+            options={
+                "device": "cpu",
+                "text_prefix": "passage",
+                "batch_size": 32,
+            },
+        )
     )
     llm_provider: ComponentConfig = field(
         default_factory=lambda: ComponentConfig(backend="mock_chat")
@@ -65,7 +72,12 @@ class AppConfig:
             extractor=_component_from_section(raw.get("extractor"), default_backend="basic_v1"),
             embedding_provider=_component_from_section(
                 raw.get("embedding_provider"),
-                default_backend="mock_text",
+                default_backend="multilingual_e5_small",
+                default_options={
+                    "device": "cpu",
+                    "text_prefix": "passage",
+                    "batch_size": 32,
+                },
             ),
             llm_provider=_component_from_section(
                 raw.get("llm_provider"), default_backend="mock_chat"

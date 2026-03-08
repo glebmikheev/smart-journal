@@ -16,9 +16,11 @@ backend = "in_process"
 backend = "basic_v1"
 
 [embedding_provider]
-backend = "mock_text"
-dim = 8
+backend = "multilingual_e5_small"
 normalize = true
+device = "cpu"
+text_prefix = "passage"
+batch_size = 32
 
 [llm_provider]
 backend = "mock_chat"
