@@ -22,6 +22,11 @@ class RegistryTests(unittest.TestCase):
         provider = registry.create(category="embedding_provider", provider_id="mock_text")
         self.assertEqual(provider.provider_id(), "mock_text")
         self.assertTrue(bool(provider.capabilities()["text"]))
+        e5_provider = registry.create(
+            category="embedding_provider",
+            provider_id="multilingual_e5_small",
+        )
+        self.assertEqual(e5_provider.provider_id(), "multilingual_e5_small")
 
     def test_registry_exposes_increment_one_backends(self) -> None:
         registry = build_default_registry()

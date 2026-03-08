@@ -13,6 +13,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(config.blob_store.backend, "local_cas")
         self.assertEqual(config.meta_store.backend, "sqlite")
         self.assertEqual(config.extractor.backend, "basic_v1")
+        self.assertEqual(config.embedding_provider.backend, "multilingual_e5_small")
         self.assertEqual(config.blob_store.options["root"], "./data/blobs")
         self.assertEqual(config.meta_store.options["path"], "./data/meta.db")
 

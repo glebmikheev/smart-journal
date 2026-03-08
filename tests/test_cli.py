@@ -19,9 +19,10 @@ class CliTests(unittest.TestCase):
 
         payload = json.loads(output.getvalue())
         self.assertIn("embedding_provider", payload)
-        provider = payload["embedding_provider"][0]
-        self.assertEqual(provider["provider_id"], "mock_text")
-        self.assertTrue(provider["capabilities"]["text"])
+        providers = payload["embedding_provider"]
+        provider_ids = {provider["provider_id"] for provider in providers}
+        self.assertIn("mock_text", provider_ids)
+        self.assertIn("multilingual_e5_small", provider_ids)
 
     def test_run_command_bootstraps_empty_app_shell(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:

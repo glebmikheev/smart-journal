@@ -29,6 +29,11 @@ class IncrementFiveAcceptanceTests(unittest.TestCase):
                         "backend": "usearch_file",
                         "root": str(tmp_path / "indexes" / "main" / "mock-text-embed-v1"),
                     },
+                    "embedding_provider": {
+                        "backend": "mock_text",
+                        "dim": 8,
+                        "normalize": True,
+                    },
                 }
             )
 

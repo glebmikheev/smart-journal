@@ -17,7 +17,7 @@ class FactoryTests(unittest.TestCase):
         self.assertEqual(bundle.vector_index.provider_id(), "in_memory")
         self.assertEqual(bundle.job_queue.provider_id(), "in_process")
         self.assertEqual(bundle.extractor.provider_id(), "basic_v1")
-        self.assertEqual(bundle.embedding_provider.provider_id(), "mock_text")
+        self.assertEqual(bundle.embedding_provider.provider_id(), "multilingual_e5_small")
         self.assertEqual(bundle.llm_provider.provider_id(), "mock_chat")
 
 
