@@ -14,6 +14,7 @@ from smart_journal.providers import (
     LocalCASBlobStore,
     MockEmbeddingProvider,
     MockLLMProvider,
+    MultilingualE5SmallEmbeddingProvider,
     PlainTextExtractor,
     SQLiteMetaStore,
     USearchFileVectorIndex,
@@ -144,6 +145,11 @@ def build_default_registry() -> ProviderRegistry:
         category="embedding_provider",
         provider_id="mock_text",
         constructor=lambda options: MockEmbeddingProvider(options),
+    )
+    registry.register(
+        category="embedding_provider",
+        provider_id="multilingual_e5_small",
+        constructor=lambda options: MultilingualE5SmallEmbeddingProvider(options),
     )
     registry.register(
         category="llm_provider",

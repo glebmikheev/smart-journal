@@ -1,3 +1,4 @@
+from .e5 import MultilingualE5SmallEmbeddingProvider
 from .local_cas import LocalCASBlobStore
 from .mock import (
     BasicExtractorV1,
@@ -16,6 +17,7 @@ __all__ = [
     "BasicExtractorV1",
     "InMemoryBlobStore",
     "LocalCASBlobStore",
+    "MultilingualE5SmallEmbeddingProvider",
     "InMemoryMetaStore",
     "InMemoryVectorIndex",
     "InProcessJobQueue",
