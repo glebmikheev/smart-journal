@@ -20,7 +20,9 @@ class SQLiteMetaStore:
         self._db_path = Path(db_path_value) if db_path_value != ":memory:" else None
         if self._db_path is not None:
             self._db_path.parent.mkdir(parents=True, exist_ok=True)
-        self._connection = sqlite3.connect(db_path_value)
+        # FastAPI runs sync endpoints in a threadpool, so sqlite calls may come
+        # from threads other than the one that created the connection.
+        self._connection = sqlite3.connect(db_path_value, check_same_thread=False)
         self._connection.row_factory = sqlite3.Row
         self._connection.execute("PRAGMA foreign_keys = ON")
         self._connection.execute("PRAGMA journal_mode = WAL")
@@ -66,6 +68,14 @@ class SQLiteMetaStore:
                 (graph_id, title, timestamp, timestamp),
             )
         return graph_id
+
+    def list_graphs(self, *, include_deleted: bool = False) -> list[Mapping[str, Any]]:
+        query = "SELECT * FROM graphs"
+        if not include_deleted:
+            query += " WHERE deleted_at IS NULL"
+        query += " ORDER BY created_at ASC"
+        rows = self._connection.execute(query).fetchall()
+        return [_row_to_dict(row) for row in rows]
 
     def get_graph(
         self, graph_id: str, *, include_deleted: bool = False

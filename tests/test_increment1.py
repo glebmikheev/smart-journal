@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
@@ -62,6 +63,9 @@ class IncrementOneAcceptanceTests(unittest.TestCase):
             bundle = ComponentFactory(build_default_registry()).create(config)
             try:
                 graph_id = bundle.meta_store.create_graph("Acceptance Graph")
+                graphs = bundle.meta_store.list_graphs()
+                self.assertEqual(len(graphs), 1)
+                self.assertEqual(str(graphs[0]["graph_id"]), graph_id)
                 node_id = bundle.meta_store.create_node(
                     graph_id=graph_id,
                     title="Node with files",
@@ -98,6 +102,38 @@ class IncrementOneAcceptanceTests(unittest.TestCase):
                 self.assertIsNotNone(deleted_node)
                 assert deleted_node is not None
                 self.assertIsNotNone(deleted_node["deleted_at"])
+            finally:
+                close_meta_store = getattr(bundle.meta_store, "close", None)
+                if callable(close_meta_store):
+                    close_meta_store()
+
+    def test_sqlite_meta_store_connection_is_usable_from_another_thread(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            db_path = Path(tmp_dir) / "meta.db"
+            bundle = ComponentFactory(build_default_registry()).create(
+                AppConfig.from_mapping(
+                    {
+                        "meta_store": {
+                            "backend": "sqlite",
+                            "path": str(db_path),
+                        }
+                    }
+                )
+            )
+            try:
+                bundle.meta_store.create_graph("Threaded graph")
+                errors: list[BaseException] = []
+
+                def _worker() -> None:
+                    try:
+                        _ = bundle.meta_store.list_graphs()
+                    except BaseException as error:  # noqa: BLE001
+                        errors.append(error)
+
+                thread = threading.Thread(target=_worker)
+                thread.start()
+                thread.join(timeout=5)
+                self.assertFalse(errors, f"Unexpected thread error: {errors}")
             finally:
                 close_meta_store = getattr(bundle.meta_store, "close", None)
                 if callable(close_meta_store):

@@ -102,6 +102,15 @@ class InMemoryMetaStore:
         }
         return graph_id
 
+    def list_graphs(self, *, include_deleted: bool = False) -> list[Mapping[str, Any]]:
+        graphs: list[Mapping[str, Any]] = [
+            dict(graph)
+            for graph in self._graphs.values()
+            if include_deleted or graph["deleted_at"] is None
+        ]
+        graphs.sort(key=lambda item: str(item["created_at"]))
+        return graphs
+
     def get_graph(
         self, graph_id: str, *, include_deleted: bool = False
     ) -> Mapping[str, Any] | None:
