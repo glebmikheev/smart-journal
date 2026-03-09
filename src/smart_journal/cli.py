@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any
@@ -41,6 +42,13 @@ def build_parser() -> argparse.ArgumentParser:
         help="Create app shell and print selected providers.",
     )
     run_parser.add_argument("--json", action="store_true", dest="as_json")
+    serve_parser = subparsers.add_parser(
+        "serve",
+        help="Run FastAPI server for web UI.",
+    )
+    serve_parser.add_argument("--host", default="127.0.0.1")
+    serve_parser.add_argument("--port", type=int, default=8000)
+    serve_parser.add_argument("--reload", action="store_true")
 
     return parser
 
@@ -74,6 +82,34 @@ def run_cli(argv: list[str] | None = None) -> int:
             return 0
         finally:
             _close_bundle_resources(bundle)
+
+    if command == "serve":
+        if args.config is not None:
+            os.environ["SMART_JOURNAL_CONFIG"] = str(args.config)
+        else:
+            os.environ.pop("SMART_JOURNAL_CONFIG", None)
+        try:
+            import uvicorn
+
+            from smart_journal.web import create_app
+
+            _ = create_app()
+        except (ImportError, RuntimeError) as error:
+            print(
+                "UI dependencies are not installed. "
+                "Install with: python -m pip install -e .[ui]"
+            )
+            print(f"Details: {error}")
+            return 2
+
+        uvicorn.run(
+            "smart_journal.web.app:create_app",
+            factory=True,
+            host=str(args.host),
+            port=int(args.port),
+            reload=bool(args.reload),
+        )
+        return 0
 
     parser.print_help()
     return 1
