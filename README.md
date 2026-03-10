@@ -28,6 +28,8 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - real embedding backend `multilingual_e5_small` (Sentence Transformers)
 - file-backed `usearch_file` VectorIndex (`indexes/.../usearch.index` + `manifest.json`)
 - replay of pending `vector_index_ops` at startup (`smart-journal run`)
+- FastAPI web backend (`smart-journal serve`) for graphs/nodes/search/ingestion/vector query
+- React web UI scaffold in `ui/` (Vite) connected to FastAPI API
 - FTS5 full-text search index in SQLite meta store
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
@@ -42,6 +44,32 @@ Increment 5 baseline for the Smart Journal knowledge base.
 python -m pip install -e .[dev]
 smart-journal providers
 smart-journal run
+```
+
+Run web API:
+
+```powershell
+python -m pip install -e .[ui]
+smart-journal serve --host 127.0.0.1 --port 8000
+```
+
+Run React UI in development mode:
+
+```powershell
+cd ui
+npm install
+npm run dev
+```
+
+Open `http://127.0.0.1:5173`.
+
+Build UI and let FastAPI serve static files from `ui/dist`:
+
+```powershell
+cd ui
+npm run build
+cd ..
+smart-journal serve
 ```
 
 Without installation:
