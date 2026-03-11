@@ -1,6 +1,7 @@
-from __future__ import annotations
+﻿from __future__ import annotations
 
 import os
+import time
 from collections.abc import Mapping, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -17,7 +18,11 @@ from smart_journal.contracts import ProviderInfo
 from smart_journal.factories import ComponentBundle, ComponentFactory
 from smart_journal.ingestion import IngestionPipeline, build_default_ingestion_pipeline
 from smart_journal.registry import ProviderRegistry, build_default_registry
-from smart_journal.vector_ops import VectorIndexOpsReplayer, VectorIndexReplayStats
+from smart_journal.vector_ops import (
+    VectorIndexOpsReplayer,
+    VectorIndexReplayStats,
+    rebuild_vector_index_from_embeddings,
+)
 
 UPLOAD_FILE = File(...)
 FORM_INGEST_NOW = Form(default=True)
@@ -36,6 +41,25 @@ class AppRuntime:
     registry: ProviderRegistry
     bundle: ComponentBundle
     ingestion: IngestionPipeline
+
+
+@dataclass(frozen=True, slots=True)
+class EmbeddingPreloadStatus:
+    enabled: bool
+    ready: bool
+    strict: bool
+    elapsed_ms: int | None
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VectorBootstrapRebuildStatus:
+    enabled: bool
+    durable_backend: bool
+    replay_applied_ops: int
+    scanned_chunks: int
+    upserted_vectors: int
+    missing_embeddings: int
 
 
 class CreateGraphRequest(BaseModel):
@@ -61,6 +85,10 @@ class VectorQueryRequest(BaseModel):
     top_k: int = Field(default=10, ge=1, le=200)
 
 
+class NameRequest(BaseModel):
+    name: str = Field(min_length=1, max_length=120)
+
+
 def create_app(config_path: Path | None = None) -> FastAPI:
     resolved_config_path = _resolve_config_path(config_path)
 
@@ -78,6 +106,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             job_queue=bundle.job_queue,
             embedding_provider=bundle.embedding_provider,
         )
+        preload_status = _preload_embedding_provider(bundle.embedding_provider)
+        rebuild_status = _rebuild_index_if_needed(
+            bundle=bundle,
+            replay_stats=replay_stats,
+        )
 
         app.state.runtime = AppRuntime(
             registry=registry,
@@ -85,6 +118,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             ingestion=ingestion,
         )
         app.state.vector_replay_bootstrap = _replay_stats_payload(replay_stats)
+        app.state.embedding_preload = _embedding_preload_payload(preload_status)
+        app.state.vector_rebuild_bootstrap = _vector_rebuild_payload(rebuild_status)
         try:
             yield
         finally:
@@ -112,6 +147,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return {
             "status": "ok",
             "bootstrap": dict(getattr(request.app.state, "vector_replay_bootstrap", {})),
+            "vector_rebuild": dict(getattr(request.app.state, "vector_rebuild_bootstrap", {})),
+            "embedding_preload": dict(getattr(request.app.state, "embedding_preload", {})),
         }
 
     @api.get("/providers/available")
@@ -156,6 +193,75 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=500, detail="Graph creation failed.")
         return _to_dict(graph)
 
+    @api.get("/graphs/{graph_id}")
+    def get_graph(
+        graph_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        graph = runtime.bundle.meta_store.get_graph(graph_id, include_deleted=include_deleted)
+        if graph is None:
+            raise HTTPException(status_code=404, detail=f"Graph not found: {graph_id}")
+        return _to_dict(graph)
+
+    @api.get("/graphs/{graph_id}/details")
+    def get_graph_details(
+        graph_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        graph = runtime.bundle.meta_store.get_graph(graph_id, include_deleted=include_deleted)
+        if graph is None:
+            raise HTTPException(status_code=404, detail=f"Graph not found: {graph_id}")
+        try:
+            nodes = runtime.bundle.meta_store.list_nodes(graph_id, include_deleted=include_deleted)
+            groups = runtime.bundle.meta_store.list_groups(
+                graph_id,
+                include_deleted=include_deleted,
+            )
+            tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=include_deleted)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+
+        group_counts = {str(group["group_id"]): 0 for group in groups}
+        tag_counts = {str(tag["tag_id"]): 0 for tag in tags}
+        for node in nodes:
+            node_id = str(node["node_id"])
+            for group in runtime.bundle.meta_store.list_node_groups(node_id):
+                group_id = str(group["group_id"])
+                if group_id in group_counts:
+                    group_counts[group_id] += 1
+            for tag in runtime.bundle.meta_store.list_node_tags(node_id):
+                tag_id = str(tag["tag_id"])
+                if tag_id in tag_counts:
+                    tag_counts[tag_id] += 1
+
+        return {
+            "graph": _to_dict(graph),
+            "nodes": [_to_dict(node) for node in nodes],
+            "groups": [
+                {
+                    **_to_dict(group),
+                    "node_count": group_counts.get(str(group["group_id"]), 0),
+                }
+                for group in groups
+            ],
+            "tags": [
+                {
+                    **_to_dict(tag),
+                    "node_count": tag_counts.get(str(tag["tag_id"]), 0),
+                }
+                for tag in tags
+            ],
+            "edges": {
+                "supported": False,
+                "items": [],
+                "note": "Edge APIs are planned for future increments.",
+            },
+        }
+
     @api.get("/graphs/{graph_id}/nodes")
     def list_graph_nodes(
         graph_id: str,
@@ -173,6 +279,67 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             ]
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
+
+    @api.get("/graphs/{graph_id}/groups")
+    def list_graph_groups(
+        graph_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        try:
+            groups = runtime.bundle.meta_store.list_groups(
+                graph_id,
+                include_deleted=include_deleted,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(group) for group in groups]
+
+    @api.post("/graphs/{graph_id}/groups", status_code=201)
+    def create_graph_group(graph_id: str, payload: NameRequest, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Group name must not be empty.")
+        try:
+            group_id = runtime.bundle.meta_store.create_group(graph_id, name)
+            groups = runtime.bundle.meta_store.list_groups(graph_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        for group in groups:
+            if str(group["group_id"]) == group_id:
+                return _to_dict(group)
+        raise HTTPException(status_code=500, detail="Group creation failed.")
+
+    @api.get("/graphs/{graph_id}/tags")
+    def list_graph_tags(
+        graph_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        try:
+            tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=include_deleted)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(tag) for tag in tags]
+
+    @api.post("/graphs/{graph_id}/tags", status_code=201)
+    def create_graph_tag(graph_id: str, payload: NameRequest, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        name = payload.name.strip()
+        if not name:
+            raise HTTPException(status_code=400, detail="Tag name must not be empty.")
+        try:
+            tag_id = runtime.bundle.meta_store.create_tag(graph_id, name)
+            tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        for tag in tags:
+            if str(tag["tag_id"]) == tag_id:
+                return _to_dict(tag)
+        raise HTTPException(status_code=500, detail="Tag creation failed.")
 
     @api.post("/graphs/{graph_id}/nodes", status_code=201)
     def create_node(graph_id: str, payload: CreateNodeRequest, request: Request) -> dict[str, Any]:
@@ -204,6 +371,112 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         if node is None:
             raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
         return _to_dict(node)
+
+    @api.get("/nodes/{node_id}/details")
+    def get_node_details(
+        node_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        node = runtime.bundle.meta_store.get_node(node_id, include_deleted=include_deleted)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+        try:
+            revisions = runtime.bundle.meta_store.list_revisions(node_id)
+            content_items = runtime.bundle.meta_store.list_content_items(
+                node_id,
+                include_deleted=include_deleted,
+            )
+            tags = runtime.bundle.meta_store.list_node_tags(node_id)
+            groups = runtime.bundle.meta_store.list_node_groups(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+
+        content_with_chunks: list[dict[str, Any]] = []
+        for content_item in content_items:
+            chunks = runtime.bundle.meta_store.list_chunks(
+                str(content_item["content_item_id"]),
+                include_deleted=include_deleted,
+            )
+            content_with_chunks.append(
+                {
+                    "content_item": _to_dict(content_item),
+                    "chunks": [_to_dict(chunk) for chunk in chunks],
+                }
+            )
+
+        return {
+            "node": _to_dict(node),
+            "revisions": [_to_dict(revision) for revision in revisions],
+            "content_items": [_to_dict(item) for item in content_items],
+            "content_chunks": content_with_chunks,
+            "tags": [_to_dict(tag) for tag in tags],
+            "groups": [_to_dict(group) for group in groups],
+            "relationships": {
+                "supported": False,
+                "items": [],
+                "note": "Relationship APIs are planned for future increments.",
+            },
+        }
+
+    @api.get("/nodes/{node_id}/tags")
+    def list_node_tags(node_id: str, request: Request) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        try:
+            tags = runtime.bundle.meta_store.list_node_tags(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(tag) for tag in tags]
+
+    @api.post("/nodes/{node_id}/tags/{tag_id}")
+    def add_node_tag(node_id: str, tag_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.add_node_tag(node_id, tag_id)
+            tags = runtime.bundle.meta_store.list_node_tags(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {"node_id": node_id, "tags": [_to_dict(tag) for tag in tags]}
+
+    @api.delete("/nodes/{node_id}/tags/{tag_id}")
+    def remove_node_tag(node_id: str, tag_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.remove_node_tag(node_id, tag_id)
+            tags = runtime.bundle.meta_store.list_node_tags(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {"node_id": node_id, "tags": [_to_dict(tag) for tag in tags]}
+
+    @api.get("/nodes/{node_id}/groups")
+    def list_node_groups(node_id: str, request: Request) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        try:
+            groups = runtime.bundle.meta_store.list_node_groups(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(group) for group in groups]
+
+    @api.post("/nodes/{node_id}/groups/{group_id}")
+    def add_node_to_group(node_id: str, group_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.add_node_to_group(node_id, group_id)
+            groups = runtime.bundle.meta_store.list_node_groups(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {"node_id": node_id, "groups": [_to_dict(group) for group in groups]}
+
+    @api.delete("/nodes/{node_id}/groups/{group_id}")
+    def remove_node_from_group(node_id: str, group_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.remove_node_from_group(node_id, group_id)
+            groups = runtime.bundle.meta_store.list_node_groups(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {"node_id": node_id, "groups": [_to_dict(group) for group in groups]}
 
     @api.patch("/nodes/{node_id}")
     def update_node(node_id: str, payload: UpdateNodeRequest, request: Request) -> dict[str, Any]:
@@ -343,6 +616,33 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
 
+    @api.get("/chunks/{chunk_id}")
+    def get_chunk(
+        chunk_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        chunk = runtime.bundle.meta_store.get_chunk(chunk_id, include_deleted=include_deleted)
+        if chunk is None:
+            raise HTTPException(status_code=404, detail=f"Chunk not found: {chunk_id}")
+        node = runtime.bundle.meta_store.get_node(
+            str(chunk["node_id"]),
+            include_deleted=include_deleted,
+        )
+        content_item = runtime.bundle.meta_store.get_content_item(
+            str(chunk["content_item_id"]),
+            include_deleted=include_deleted,
+        )
+        return {
+            "chunk": {
+                **_to_dict(chunk),
+                "text_preview": _preview_text(str(chunk.get("text", ""))),
+            },
+            "node": _node_summary(node),
+            "content_item": _content_item_summary(content_item),
+        }
+
     @api.post("/jobs/process-next")
     def process_next_job(request: Request) -> dict[str, Any]:
         runtime = _runtime_from_request(request)
@@ -400,13 +700,41 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 "results": [],
             }
         results = runtime.bundle.vector_index.query(vectors[0], top_k=payload.top_k)
+        enriched_results: list[dict[str, Any]] = []
+        for result in results:
+            chunk_id = result.external_id
+            chunk = runtime.bundle.meta_store.get_chunk(chunk_id)
+            if chunk is None:
+                enriched_results.append(
+                    {
+                        "external_id": chunk_id,
+                        "chunk_id": chunk_id,
+                        "score": float(result.score),
+                        "chunk": None,
+                        "node": None,
+                        "content_item": None,
+                    }
+                )
+                continue
+            node = runtime.bundle.meta_store.get_node(str(chunk["node_id"]))
+            content_item = runtime.bundle.meta_store.get_content_item(str(chunk["content_item_id"]))
+            enriched_results.append(
+                {
+                    "external_id": chunk_id,
+                    "chunk_id": chunk_id,
+                    "score": float(result.score),
+                    "chunk": {
+                        **_to_dict(chunk),
+                        "text_preview": _preview_text(str(chunk.get("text", ""))),
+                    },
+                    "node": _node_summary(node),
+                    "content_item": _content_item_summary(content_item),
+                }
+            )
         return {
             "query": payload.query,
             "model_id": runtime.bundle.embedding_provider.model_id(),
-            "results": [
-                {"external_id": result.external_id, "score": float(result.score)}
-                for result in results
-            ],
+            "results": enriched_results,
         }
 
     @api.post("/vector/replay")
@@ -482,6 +810,36 @@ def _provider_payload(provider: ProviderInfo) -> dict[str, Any]:
     }
 
 
+def _node_summary(node: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if node is None:
+        return None
+    return {
+        "node_id": str(node.get("node_id")),
+        "graph_id": str(node.get("graph_id")),
+        "title": str(node.get("title")),
+        "updated_at": node.get("updated_at"),
+    }
+
+
+def _content_item_summary(content_item: Mapping[str, Any] | None) -> dict[str, Any] | None:
+    if content_item is None:
+        return None
+    return {
+        "content_item_id": str(content_item.get("content_item_id")),
+        "node_id": str(content_item.get("node_id")),
+        "filename": content_item.get("filename"),
+        "mime_type": content_item.get("mime_type"),
+        "extraction_status": content_item.get("extraction_status"),
+    }
+
+
+def _preview_text(text: str, *, limit: int = 180) -> str:
+    normalized = " ".join(text.split())
+    if len(normalized) <= limit:
+        return normalized
+    return normalized[: max(1, limit - 3)].rstrip() + "..."
+
+
 def _replay_vector_index(*, bundle: ComponentBundle, limit: int) -> VectorIndexReplayStats:
     replayer = VectorIndexOpsReplayer(
         meta_store=bundle.meta_store,
@@ -498,6 +856,105 @@ def _replay_stats_payload(stats: VectorIndexReplayStats) -> dict[str, int]:
         "upserted_vectors": stats.upserted_vectors,
         "deleted_vectors": stats.deleted_vectors,
     }
+
+
+def _preload_embedding_provider(provider: Any) -> EmbeddingPreloadStatus:
+    enabled = _read_bool_env("SMART_JOURNAL_PRELOAD_EMBEDDER", default=True)
+    strict = _read_bool_env("SMART_JOURNAL_PRELOAD_EMBEDDER_STRICT", default=False)
+    if not enabled:
+        return EmbeddingPreloadStatus(
+            enabled=False,
+            ready=False,
+            strict=strict,
+            elapsed_ms=None,
+            error=None,
+        )
+
+    started = time.perf_counter()
+    try:
+        provider.embed_text(["startup warmup"])
+    except Exception as error:  # noqa: BLE001
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        if strict:
+            raise RuntimeError("Embedding provider warmup failed during startup.") from error
+        return EmbeddingPreloadStatus(
+            enabled=True,
+            ready=False,
+            strict=False,
+            elapsed_ms=elapsed_ms,
+            error=_error_text(error),
+        )
+
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    return EmbeddingPreloadStatus(
+        enabled=True,
+        ready=True,
+        strict=strict,
+        elapsed_ms=elapsed_ms,
+        error=None,
+    )
+
+
+def _embedding_preload_payload(status: EmbeddingPreloadStatus) -> dict[str, Any]:
+    return {
+        "enabled": status.enabled,
+        "ready": status.ready,
+        "strict": status.strict,
+        "elapsed_ms": status.elapsed_ms,
+        "error": status.error,
+    }
+
+
+def _rebuild_index_if_needed(
+    *,
+    bundle: ComponentBundle,
+    replay_stats: VectorIndexReplayStats,
+) -> VectorBootstrapRebuildStatus:
+    capabilities = bundle.vector_index.capabilities()
+    durable_backend = bool(capabilities.get("durable", False))
+    has_index_artifact = _has_index_artifact(capabilities)
+    enabled = replay_stats.applied_ops == 0 and ((not durable_backend) or (not has_index_artifact))
+    if not enabled:
+        return VectorBootstrapRebuildStatus(
+            enabled=False,
+            durable_backend=durable_backend,
+            replay_applied_ops=replay_stats.applied_ops,
+            scanned_chunks=0,
+            upserted_vectors=0,
+            missing_embeddings=0,
+        )
+
+    stats = rebuild_vector_index_from_embeddings(
+        meta_store=bundle.meta_store,
+        vector_index=bundle.vector_index,
+        model_id=bundle.embedding_provider.model_id(),
+    )
+    return VectorBootstrapRebuildStatus(
+        enabled=True,
+        durable_backend=False,
+        replay_applied_ops=replay_stats.applied_ops,
+        scanned_chunks=stats.scanned_chunks,
+        upserted_vectors=stats.upserted_vectors,
+        missing_embeddings=stats.missing_embeddings,
+    )
+
+
+def _vector_rebuild_payload(status: VectorBootstrapRebuildStatus) -> dict[str, Any]:
+    return {
+        "enabled": status.enabled,
+        "durable_backend": status.durable_backend,
+        "replay_applied_ops": status.replay_applied_ops,
+        "scanned_chunks": status.scanned_chunks,
+        "upserted_vectors": status.upserted_vectors,
+        "missing_embeddings": status.missing_embeddings,
+    }
+
+
+def _has_index_artifact(capabilities: Mapping[str, Any]) -> bool:
+    index_file = capabilities.get("index_file")
+    if not isinstance(index_file, str) or not index_file.strip():
+        return True
+    return Path(index_file).exists()
 
 
 def _resolve_config_path(config_path: Path | None) -> Path | None:
@@ -519,6 +976,16 @@ def _cors_origins() -> list[str]:
         "http://localhost:4173",
         "http://127.0.0.1:4173",
     ]
+
+
+def _read_bool_env(name: str, *, default: bool) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    normalized = raw.strip().lower()
+    if not normalized:
+        return default
+    return normalized in {"1", "true", "yes", "on"}
 
 
 def _close_bundle_resources(bundle: ComponentBundle) -> None:
