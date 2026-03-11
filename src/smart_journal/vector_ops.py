@@ -15,6 +15,13 @@ class VectorIndexReplayStats:
     deleted_vectors: int
 
 
+@dataclass(frozen=True, slots=True)
+class VectorIndexRebuildStats:
+    scanned_chunks: int
+    upserted_vectors: int
+    missing_embeddings: int
+
+
 class VectorIndexOpsReplayer:
     def __init__(
         self,
@@ -79,6 +86,61 @@ class VectorIndexOpsReplayer:
             upserted_vectors=len(upserts),
             deleted_vectors=len(deletes),
         )
+
+
+def rebuild_vector_index_from_embeddings(
+    *,
+    meta_store: MetaStore,
+    vector_index: VectorIndex,
+    model_id: str,
+    batch_size: int = 256,
+) -> VectorIndexRebuildStats:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be greater than 0.")
+
+    pending_vectors: list[tuple[str, list[float]]] = []
+    scanned_chunks = 0
+    upserted_vectors = 0
+    missing_embeddings = 0
+
+    graphs = meta_store.list_graphs()
+    for graph in graphs:
+        graph_id = str(graph["graph_id"])
+        for node in meta_store.list_nodes(graph_id):
+            node_id = str(node["node_id"])
+            for content_item in meta_store.list_content_items(node_id):
+                content_item_id = str(content_item["content_item_id"])
+                for chunk in meta_store.list_chunks(content_item_id):
+                    scanned_chunks += 1
+                    chunk_id = str(chunk["chunk_id"])
+                    embedding = meta_store.get_chunk_embedding(chunk_id, model_id)
+                    if embedding is None:
+                        missing_embeddings += 1
+                        continue
+                    try:
+                        vector = _coerce_vector(embedding)
+                    except TypeError:
+                        missing_embeddings += 1
+                        continue
+                    pending_vectors.append((chunk_id, vector))
+                    if len(pending_vectors) >= batch_size:
+                        vector_index.upsert(pending_vectors)
+                        upserted_vectors += len(pending_vectors)
+                        pending_vectors.clear()
+
+    if pending_vectors:
+        vector_index.upsert(pending_vectors)
+        upserted_vectors += len(pending_vectors)
+        pending_vectors.clear()
+
+    if upserted_vectors > 0:
+        vector_index.save()
+
+    return VectorIndexRebuildStats(
+        scanned_chunks=scanned_chunks,
+        upserted_vectors=upserted_vectors,
+        missing_embeddings=missing_embeddings,
+    )
 
 
 def _coerce_vector(raw_embedding: Mapping[str, Any]) -> list[float]:

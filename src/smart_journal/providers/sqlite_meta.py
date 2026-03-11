@@ -423,6 +423,19 @@ class SQLiteMetaStore:
         payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
         return payload
 
+    def get_chunk(
+        self,
+        chunk_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> Mapping[str, Any] | None:
+        query = "SELECT * FROM chunks WHERE chunk_id = ?"
+        params: tuple[Any, ...] = (chunk_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        row = self._connection.execute(query, params).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
     def upsert_chunk_embeddings(self, embeddings: Sequence[Mapping[str, Any]]) -> None:
         if not embeddings:
             return
@@ -1207,8 +1220,10 @@ def _build_fts_query(raw_query: str) -> str:
     terms = [term.strip() for term in raw_query.split() if term.strip()]
     if not terms:
         return ""
-    escaped = [term.replace('"', '""') for term in terms]
-    quoted = [f'"{term}"' for term in escaped]
+    escaped = [term.replace('"', '""').replace("*", "") for term in terms]
+    quoted = [f'"{term}"*' for term in escaped if term]
+    if not quoted:
+        return ""
     return " AND ".join(quoted)
 
 

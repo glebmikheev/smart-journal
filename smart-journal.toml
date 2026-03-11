@@ -7,7 +7,8 @@ backend = "sqlite"
 path = "./data/meta.db"
 
 [vector_index]
-backend = "in_memory"
+backend = "usearch_file"
+root = "./data/indexes/default/multilingual-e5-small"
 
 [job_queue]
 backend = "in_process"

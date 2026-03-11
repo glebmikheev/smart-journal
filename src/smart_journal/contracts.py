@@ -132,6 +132,10 @@ class MetaStore(ProviderInfo, Protocol):
         self, content_item_id: str, *, include_deleted: bool = False
     ) -> list[Mapping[str, Any]]: ...
 
+    def get_chunk(
+        self, chunk_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None: ...
+
     def upsert_chunk_embeddings(
         self,
         embeddings: Sequence[Mapping[str, Any]],

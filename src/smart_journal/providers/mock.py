@@ -351,6 +351,21 @@ class InMemoryMetaStore:
         payload.sort(key=lambda chunk: int(chunk["chunk_index"]))
         return payload
 
+    def get_chunk(
+        self,
+        chunk_id: str,
+        *,
+        include_deleted: bool = False,
+    ) -> Mapping[str, Any] | None:
+        for chunks in self._chunks_by_content_item.values():
+            for chunk in chunks:
+                if str(chunk["chunk_id"]) != chunk_id:
+                    continue
+                if not include_deleted and chunk["deleted_at"] is not None:
+                    return None
+                return dict(chunk)
+        return None
+
     def upsert_chunk_embeddings(self, embeddings: Sequence[Mapping[str, Any]]) -> None:
         for embedding in embeddings:
             chunk_id = str(embedding["chunk_id"])
