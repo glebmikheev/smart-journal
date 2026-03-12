@@ -30,6 +30,11 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - replay of pending `vector_index_ops` at startup (`smart-journal run`)
 - FastAPI web backend (`smart-journal serve`) for graphs/nodes/search/ingestion/vector query
 - React web UI scaffold in `ui/` (Vite) connected to FastAPI API
+- embedder warmup at API startup (default enabled) to avoid first-query latency
+- FTS prefix search (`te` matches `test`)
+- vector query payload enriched with chunk/node/content context
+- graph/node detail API + group/tag APIs (without edge CRUD yet)
+- startup auto-rebuild of non-durable vector index backends (e.g. `in_memory`) from embeddings
 - FTS5 full-text search index in SQLite meta store
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
@@ -70,6 +75,13 @@ cd ui
 npm run build
 cd ..
 smart-journal serve
+```
+
+Optional env vars for embedder warmup:
+
+```powershell
+$env:SMART_JOURNAL_PRELOAD_EMBEDDER = "1"          # default: enabled
+$env:SMART_JOURNAL_PRELOAD_EMBEDDER_STRICT = "0"   # if 1: startup fails on warmup error
 ```
 
 Without installation:

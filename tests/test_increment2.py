@@ -93,6 +93,10 @@ class IncrementTwoAcceptanceTests(unittest.TestCase):
                 pdf_chunks = bundle.meta_store.list_chunks(pdf_item_id)
                 self.assertGreaterEqual(len(md_chunks), 1)
                 self.assertGreaterEqual(len(pdf_chunks), 1)
+                first_md_chunk = bundle.meta_store.get_chunk(str(md_chunks[0]["chunk_id"]))
+                self.assertIsNotNone(first_md_chunk)
+                assert first_md_chunk is not None
+                self.assertEqual(str(first_md_chunk["content_item_id"]), markdown_item_id)
                 for chunk in md_chunks + pdf_chunks:
                     self.assertEqual(len(str(chunk["checksum"])), 64)
             finally:

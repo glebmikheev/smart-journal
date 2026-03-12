@@ -154,6 +154,8 @@ class IncrementThreeAcceptanceTests(unittest.TestCase):
                 beta_after_update = bundle.meta_store.search_fulltext("beta", graph_id=graph_id)
                 self.assertEqual(alpha_after_update, [])
                 self.assertEqual([row["node_id"] for row in beta_after_update], [node_id])
+                prefix_results = bundle.meta_store.search_fulltext("be", graph_id=graph_id)
+                self.assertEqual([row["node_id"] for row in prefix_results], [node_id])
 
                 bundle.meta_store.remove_node_tag(node_id, tag_id)
                 bundle.meta_store.remove_node_from_group(node_id, group_id)
