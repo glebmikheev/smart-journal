@@ -40,11 +40,61 @@ export function listNodes(graphId) {
   return request(`/api/graphs/${encodeURIComponent(graphId)}/nodes`);
 }
 
+export function getGraphDetails(graphId) {
+  return request(`/api/graphs/${encodeURIComponent(graphId)}/details`);
+}
+
 export function createNode(graphId, payload) {
   return request(`/api/graphs/${encodeURIComponent(graphId)}/nodes`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(payload)
+  });
+}
+
+export function getNodeDetails(nodeId) {
+  return request(`/api/nodes/${encodeURIComponent(nodeId)}/details`);
+}
+
+export function createGroup(graphId, name) {
+  return request(`/api/graphs/${encodeURIComponent(graphId)}/groups`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+}
+
+export function addNodeToGroup(nodeId, groupId) {
+  return request(
+    `/api/nodes/${encodeURIComponent(nodeId)}/groups/${encodeURIComponent(groupId)}`,
+    { method: "POST" }
+  );
+}
+
+export function removeNodeFromGroup(nodeId, groupId) {
+  return request(
+    `/api/nodes/${encodeURIComponent(nodeId)}/groups/${encodeURIComponent(groupId)}`,
+    { method: "DELETE" }
+  );
+}
+
+export function createTag(graphId, name) {
+  return request(`/api/graphs/${encodeURIComponent(graphId)}/tags`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ name })
+  });
+}
+
+export function addNodeTag(nodeId, tagId) {
+  return request(`/api/nodes/${encodeURIComponent(nodeId)}/tags/${encodeURIComponent(tagId)}`, {
+    method: "POST"
+  });
+}
+
+export function removeNodeTag(nodeId, tagId) {
+  return request(`/api/nodes/${encodeURIComponent(nodeId)}/tags/${encodeURIComponent(tagId)}`, {
+    method: "DELETE"
   });
 }
 

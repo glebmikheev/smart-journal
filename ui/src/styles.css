@@ -149,6 +149,7 @@ code {
 
 input,
 textarea,
+select,
 button {
   border-radius: var(--radius-sm);
   border: 1px solid rgba(137, 173, 215, 0.35);
@@ -156,7 +157,8 @@ button {
 }
 
 input,
-textarea {
+textarea,
+select {
   padding: 0.58rem 0.7rem;
   color: var(--text-main);
   background: rgba(16, 26, 44, 0.9);
@@ -200,6 +202,10 @@ button:disabled {
   border: 1px solid rgba(136, 170, 207, 0.2);
 }
 
+.result-row {
+  width: 100%;
+}
+
 .item-row.active {
   border-color: var(--accent-strong);
   box-shadow: 0 0 0 1px rgba(59, 196, 141, 0.6);
@@ -227,6 +233,53 @@ button:disabled {
   display: flex;
   justify-content: space-between;
   gap: 0.6rem;
+}
+
+.results-grid li > button:not(.item-row) {
+  background: rgba(99, 19, 24, 0.65);
+  color: #ffd7d7;
+  border: 1px solid rgba(255, 145, 145, 0.4);
+  padding: 0.25rem 0.5rem;
+}
+
+.details-grid {
+  display: grid;
+  gap: 0.55rem;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  margin-bottom: 0.8rem;
+}
+
+.details-grid > div {
+  padding: 0.5rem 0.6rem;
+  border-radius: var(--radius-sm);
+  background: rgba(18, 29, 46, 0.8);
+  border: 1px solid rgba(136, 170, 207, 0.2);
+  display: grid;
+  gap: 0.25rem;
+}
+
+.chunk-preview {
+  border-radius: var(--radius-sm);
+  border: 1px solid rgba(136, 170, 207, 0.2);
+  background: rgba(18, 29, 46, 0.8);
+  padding: 0.6rem;
+}
+
+.chunk-preview p {
+  margin: 0 0 0.4rem;
+  color: var(--text-main);
+}
+
+.inline-form {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 0.45rem;
+  margin-bottom: 0.6rem;
+}
+
+.results-grid article button {
+  padding: 0.35rem 0.5rem;
+  border-radius: var(--radius-sm);
 }
 
 .empty-state {
