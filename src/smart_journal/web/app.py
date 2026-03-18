@@ -18,6 +18,7 @@ from smart_journal.contracts import ProviderInfo
 from smart_journal.factories import ComponentBundle, ComponentFactory
 from smart_journal.ingestion import IngestionPipeline, build_default_ingestion_pipeline
 from smart_journal.registry import ProviderRegistry, build_default_registry
+from smart_journal.semantic import SemanticLinker
 from smart_journal.vector_ops import (
     VectorIndexOpsReplayer,
     VectorIndexReplayStats,
@@ -34,6 +35,10 @@ QUERY_GROUP_ID = Query(default=None)
 QUERY_TAG_IDS = Query(default=None)
 QUERY_SEARCH_LIMIT = Query(default=20, ge=1, le=200)
 QUERY_REPLAY_LIMIT = Query(default=1000, ge=1, le=50_000)
+QUERY_EDGE_TYPE = Query(default=None)
+QUERY_EDGE_STATUS = Query(default=None)
+QUERY_EDGE_NODE_ID = Query(default=None)
+QUERY_EDGE_LIMIT = Query(default=200, ge=1, le=2_000)
 
 
 @dataclass(slots=True)
@@ -87,6 +92,16 @@ class VectorQueryRequest(BaseModel):
 
 class NameRequest(BaseModel):
     name: str = Field(min_length=1, max_length=120)
+
+
+class SemanticSuggestRequest(BaseModel):
+    top_k_per_chunk: int = Field(default=10, ge=1, le=200)
+    max_suggestions: int = Field(default=10, ge=1, le=200)
+    replay_vector_ops: bool = True
+
+
+class EdgeStatusRequest(BaseModel):
+    status: str = Field(min_length=1, max_length=32)
 
 
 def create_app(config_path: Path | None = None) -> FastAPI:
@@ -338,6 +353,33 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             },
         }
 
+    @api.get("/graphs/{graph_id}/edges")
+    def list_graph_edges(
+        graph_id: str,
+        request: Request,
+        edge_type: str | None = QUERY_EDGE_TYPE,
+        status: str | None = QUERY_EDGE_STATUS,
+        node_id: str | None = QUERY_EDGE_NODE_ID,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+        limit: int = QUERY_EDGE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        graph = runtime.bundle.meta_store.get_graph(graph_id, include_deleted=include_deleted)
+        if graph is None:
+            raise HTTPException(status_code=404, detail=f"Graph not found: {graph_id}")
+        try:
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=graph_id,
+                node_id=node_id,
+                edge_type=edge_type,
+                status=status,
+                include_deleted=include_deleted,
+                limit=limit,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(edge) for edge in edges]
+
     @api.get("/graphs/{graph_id}/nodes")
     def list_graph_nodes(
         graph_id: str,
@@ -494,6 +536,77 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 "items": [],
                 "note": "Relationship APIs are planned for future increments.",
             },
+        }
+
+    @api.get("/nodes/{node_id}/edges")
+    def list_node_edges(
+        node_id: str,
+        request: Request,
+        edge_type: str | None = QUERY_EDGE_TYPE,
+        status: str | None = QUERY_EDGE_STATUS,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+        limit: int = QUERY_EDGE_LIMIT,
+    ) -> list[dict[str, Any]]:
+        runtime = _runtime_from_request(request)
+        node = runtime.bundle.meta_store.get_node(node_id, include_deleted=include_deleted)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+        try:
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=str(node["graph_id"]),
+                node_id=node_id,
+                edge_type=edge_type,
+                status=status,
+                include_deleted=include_deleted,
+                limit=limit,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return [_to_dict(edge) for edge in edges]
+
+    @api.post("/nodes/{node_id}/semantic/suggest")
+    def suggest_semantic_links(
+        node_id: str,
+        payload: SemanticSuggestRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        node = runtime.bundle.meta_store.get_node(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+        replay_stats: dict[str, Any] | None = None
+        try:
+            if payload.replay_vector_ops:
+                replay_stats = _replay_stats_payload(
+                    _replay_vector_index(bundle=runtime.bundle, limit=10_000)
+                )
+            linker = SemanticLinker(
+                meta_store=runtime.bundle.meta_store,
+                vector_index=runtime.bundle.vector_index,
+                model_id=runtime.bundle.embedding_provider.model_id(),
+            )
+            suggestions = linker.suggest_for_node(
+                node_id=node_id,
+                top_k_per_chunk=payload.top_k_per_chunk,
+                max_suggestions=payload.max_suggestions,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "node_id": node_id,
+            "graph_id": str(node["graph_id"]),
+            "suggestions": [
+                {
+                    "edge_id": suggestion.edge_id,
+                    "from_node_id": suggestion.from_node_id,
+                    "to_node_id": suggestion.to_node_id,
+                    "status": suggestion.status,
+                    "weight": float(suggestion.weight),
+                    "supporting_chunk_hits": int(suggestion.supporting_chunk_hits),
+                }
+                for suggestion in suggestions
+            ],
+            "vector_replay": replay_stats,
         }
 
     @api.get("/nodes/{node_id}/tags")
@@ -742,6 +855,49 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         if job is None:
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
         return _to_dict(job)
+
+    @api.patch("/edges/{edge_id}")
+    def patch_edge(
+        edge_id: str,
+        payload: EdgeStatusRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.update_edge(
+                edge_id=edge_id,
+                status=payload.status.strip().lower(),
+            )
+            edge = runtime.bundle.meta_store.get_edge(edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if edge is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        return _to_dict(edge)
+
+    @api.post("/edges/{edge_id}/accept")
+    def accept_edge(edge_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.update_edge(edge_id=edge_id, status="accepted")
+            edge = runtime.bundle.meta_store.get_edge(edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if edge is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        return _to_dict(edge)
+
+    @api.post("/edges/{edge_id}/reject")
+    def reject_edge(edge_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            runtime.bundle.meta_store.update_edge(edge_id=edge_id, status="rejected")
+            edge = runtime.bundle.meta_store.get_edge(edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if edge is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        return _to_dict(edge)
 
     @api.get("/search")
     def search_nodes(
