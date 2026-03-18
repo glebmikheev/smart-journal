@@ -67,6 +67,7 @@ class InMemoryMetaStore:
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
         self._chunk_embeddings: dict[tuple[str, str], dict[str, Any]] = {}
         self._vector_index_ops: dict[str, dict[str, Any]] = {}
+        self._edges: dict[str, dict[str, Any]] = {}
         self._tags: dict[str, dict[str, Any]] = {}
         self._groups: dict[str, dict[str, Any]] = {}
         self._node_tags: dict[str, set[str]] = {}
@@ -193,6 +194,9 @@ class InMemoryMetaStore:
         self._revisions_by_node.pop(node_id, None)
         self._node_tags.pop(node_id, None)
         self._node_groups.pop(node_id, None)
+        for edge_id, edge in list(self._edges.items()):
+            if edge["from_node_id"] == node_id or edge["to_node_id"] == node_id:
+                self._edges.pop(edge_id, None)
         for content_item_id, item in list(self._content_items.items()):
             if item["node_id"] == node_id:
                 self._content_items.pop(content_item_id, None)
@@ -518,6 +522,99 @@ class InMemoryMetaStore:
                 continue
             row["status"] = "applied"
             row["applied_at"] = timestamp
+
+    def create_edge(
+        self,
+        *,
+        graph_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        status: str = "pending",
+        weight: float | None = None,
+    ) -> str:
+        if from_node_id == to_node_id:
+            raise ValueError("Self-loop edges are not supported in alpha.")
+        graph = self.get_graph(graph_id)
+        if graph is None:
+            raise KeyError(f"Graph not found or deleted: {graph_id}")
+        from_node = self.get_node(from_node_id)
+        to_node = self.get_node(to_node_id)
+        if from_node is None:
+            raise KeyError(f"Node not found or deleted: {from_node_id}")
+        if to_node is None:
+            raise KeyError(f"Node not found or deleted: {to_node_id}")
+        if str(from_node["graph_id"]) != graph_id or str(to_node["graph_id"]) != graph_id:
+            raise ValueError("Edge endpoints must belong to the same graph.")
+        next_status = _validate_edge_status(status)
+        edge_id = str(uuid4())
+        timestamp = _utc_now()
+        self._edges[edge_id] = {
+            "edge_id": edge_id,
+            "graph_id": graph_id,
+            "from_node_id": from_node_id,
+            "to_node_id": to_node_id,
+            "edge_type": edge_type,
+            "status": next_status,
+            "weight": (float(weight) if weight is not None else None),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "deleted_at": None,
+        }
+        return edge_id
+
+    def get_edge(self, edge_id: str, *, include_deleted: bool = False) -> Mapping[str, Any] | None:
+        edge = self._edges.get(edge_id)
+        if edge is None:
+            return None
+        if not include_deleted and edge["deleted_at"] is not None:
+            return None
+        return dict(edge)
+
+    def list_edges(
+        self,
+        *,
+        graph_id: str | None = None,
+        node_id: str | None = None,
+        edge_type: str | None = None,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            return []
+        rows: list[dict[str, Any]] = []
+        for edge in self._edges.values():
+            if not include_deleted and edge["deleted_at"] is not None:
+                continue
+            if graph_id is not None and str(edge["graph_id"]) != graph_id:
+                continue
+            if node_id is not None:
+                if str(edge["from_node_id"]) != node_id and str(edge["to_node_id"]) != node_id:
+                    continue
+            if edge_type is not None and str(edge["edge_type"]) != edge_type:
+                continue
+            if status is not None and str(edge["status"]) != status:
+                continue
+            rows.append(dict(edge))
+        rows.sort(key=lambda row: (str(row["updated_at"]), str(row["edge_id"])), reverse=True)
+        return [dict(row) for row in rows[:limit]]
+
+    def update_edge(
+        self,
+        edge_id: str,
+        *,
+        status: str | None = None,
+        weight: float | None = None,
+    ) -> None:
+        edge = self._edges.get(edge_id)
+        if edge is None or edge["deleted_at"] is not None:
+            raise KeyError(f"Edge not found or deleted: {edge_id}")
+        if status is not None:
+            edge["status"] = _validate_edge_status(status)
+        if weight is not None:
+            edge["weight"] = float(weight)
+        edge["updated_at"] = _utc_now()
 
     def create_tag(self, graph_id: str, name: str) -> str:
         if self.get_graph(graph_id) is None:
@@ -1031,6 +1128,15 @@ def _coerce_vector(raw: Any) -> list[float]:
     if isinstance(raw, Sequence) and not isinstance(raw, str | bytes | bytearray):
         return [float(value) for value in raw]
     raise TypeError("Embedding vector must be a sequence of floats.")
+
+
+def _validate_edge_status(status: str) -> str:
+    normalized = status.strip().lower()
+    allowed = {"pending", "accepted", "rejected", "stale", "possibly_stale"}
+    if normalized not in allowed:
+        known = ", ".join(sorted(allowed))
+        raise ValueError(f"Unsupported edge status '{status}'. Known statuses: {known}")
+    return normalized
 
 
 def _cosine_similarity(lhs: Sequence[float], rhs: Sequence[float]) -> float:
