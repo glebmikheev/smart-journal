@@ -1,0 +1,27 @@
+[blob_store]
+backend = "local_cas"
+root = "./data/blobs"
+
+[meta_store]
+backend = "sqlite"
+path = "./data/meta.db"
+
+[vector_index]
+backend = "usearch_file"
+root = "./data/indexes/default/multilingual-e5-small"
+
+[job_queue]
+backend = "in_process"
+
+[extractor]
+backend = "basic_v1"
+
+[embedding_provider]
+backend = "multilingual_e5_small"
+normalize = true
+device = "cpu"
+text_prefix = "passage"
+batch_size = 32
+
+[llm_provider]
+backend = "mock_chat"
