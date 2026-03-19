@@ -696,6 +696,47 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             _raise_http_error(error)
         return [_to_dict(revision) for revision in revisions]
 
+    @api.post("/nodes/{node_id}/revisions/{revision_id}/rollback")
+    def rollback_node_revision(node_id: str, revision_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            new_revision_id = runtime.bundle.meta_store.rollback_node_to_revision(
+                node_id=node_id,
+                revision_id=revision_id,
+            )
+            node = runtime.bundle.meta_store.get_node(node_id, include_deleted=True)
+            revisions = runtime.bundle.meta_store.list_revisions(node_id)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+        return {
+            "node": _to_dict(node),
+            "current_revision_id": new_revision_id,
+            "revisions": [_to_dict(revision) for revision in revisions],
+        }
+
+    @api.post("/nodes/{node_id}/edges/mark-stale")
+    def mark_node_edges_stale(node_id: str, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            changed = runtime.bundle.meta_store.mark_node_edges_stale(node_id)
+            node = runtime.bundle.meta_store.get_node(node_id)
+            graph_id = str(node["graph_id"]) if node is not None else None
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=graph_id,
+                node_id=node_id,
+                include_deleted=False,
+                limit=500,
+            ) if graph_id is not None else []
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "node_id": node_id,
+            "changed_edges": int(changed),
+            "edges": [_to_dict(edge) for edge in edges],
+        }
+
     @api.get("/nodes/{node_id}/content-items")
     def list_content_items(
         node_id: str,
