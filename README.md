@@ -1,5 +1,7 @@
 # Smart Journal
 
+See [the design docuemnt](https://github.com/glebmikheev/smart-journal/blob/873947e/design-doc.md) for details.
+
 Increment 5 baseline for the Smart Journal knowledge base.
 
 ## What is implemented
