@@ -119,6 +119,51 @@ class IncrementSevenAcceptanceTests(unittest.TestCase):
             finally:
                 meta_store.close()
 
+    def test_revision_diff_reports_attachment_manifest_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            meta_store = SQLiteMetaStore({"path": str(Path(tmp_dir) / "meta.db")})
+            blob_store = MutableInMemoryBlobStore()
+            try:
+                graph_id = meta_store.create_graph("Increment 7 graph")
+                node_id = meta_store.create_node(graph_id=graph_id, title="Node", body="v1")
+                revisions = meta_store.list_revisions(node_id)
+                revision_one = str(revisions[0]["revision_id"])
+
+                blob_a = blob_store.put(b"alpha", content_type="text/plain")
+                item_a = meta_store.attach_content_item(
+                    node_id=node_id,
+                    blob_ref=blob_a,
+                    filename="a.txt",
+                    mime_type="text/plain",
+                )
+                meta_store.update_node(node_id, body="v2")
+                revisions = meta_store.list_revisions(node_id)
+                revision_two = str(revisions[-1]["revision_id"])
+
+                blob_b = blob_store.put(b"beta", content_type="text/plain")
+                item_b = meta_store.attach_content_item(
+                    node_id=node_id,
+                    blob_ref=blob_b,
+                    filename="b.txt",
+                    mime_type="text/plain",
+                )
+                meta_store.detach_content_item(item_a)
+                meta_store.update_node(node_id, body="v3")
+                revisions = meta_store.list_revisions(node_id)
+                revision_three = str(revisions[-1]["revision_id"])
+
+                diff_12 = meta_store.diff_revisions(node_id, revision_one, revision_two)
+                self.assertEqual(diff_12["added_content_item_ids"], [item_a])
+                self.assertEqual(diff_12["removed_content_item_ids"], [])
+                self.assertTrue(bool(diff_12["body_changed"]))
+
+                diff_23 = meta_store.diff_revisions(node_id, revision_two, revision_three)
+                self.assertEqual(diff_23["added_content_item_ids"], [item_b])
+                self.assertEqual(diff_23["removed_content_item_ids"], [item_a])
+                self.assertTrue(bool(diff_23["body_changed"]))
+            finally:
+                meta_store.close()
+
     def test_targeted_recompute_refreshes_only_affected_node_semantic_edges(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             meta_store = SQLiteMetaStore({"path": str(Path(tmp_dir) / "meta.db")})

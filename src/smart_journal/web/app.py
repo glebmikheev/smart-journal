@@ -749,6 +749,24 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             _raise_http_error(error)
         return [_to_dict(revision) for revision in revisions]
 
+    @api.get("/nodes/{node_id}/revisions/diff")
+    def diff_node_revisions(
+        node_id: str,
+        request: Request,
+        from_revision_id: str = Query(min_length=1),
+        to_revision_id: str = Query(min_length=1),
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        try:
+            payload = runtime.bundle.meta_store.diff_revisions(
+                node_id=node_id,
+                from_revision_id=from_revision_id,
+                to_revision_id=to_revision_id,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return _to_dict(payload)
+
     @api.post("/nodes/{node_id}/revisions/{revision_id}/rollback")
     def rollback_node_revision(node_id: str, revision_id: str, request: Request) -> dict[str, Any]:
         runtime = _runtime_from_request(request)
