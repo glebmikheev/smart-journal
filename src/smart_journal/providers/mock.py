@@ -63,6 +63,7 @@ class InMemoryMetaStore:
         self._graphs: dict[str, dict[str, Any]] = {}
         self._nodes: dict[str, dict[str, Any]] = {}
         self._revisions_by_node: dict[str, list[dict[str, Any]]] = {}
+        self._revision_content_manifest: dict[str, list[str]] = {}
         self._content_items: dict[str, dict[str, Any]] = {}
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
         self._chunk_embeddings: dict[tuple[str, str], dict[str, Any]] = {}
@@ -149,6 +150,7 @@ class InMemoryMetaStore:
                 "comment": "create",
             }
         ]
+        self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
         return node_id
 
     def update_node(
@@ -178,6 +180,7 @@ class InMemoryMetaStore:
             }
         )
         node["current_revision_id"] = revision_id
+        self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
         self.mark_node_edges_stale(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
@@ -192,7 +195,9 @@ class InMemoryMetaStore:
             return
 
         self._nodes.pop(node_id, None)
-        self._revisions_by_node.pop(node_id, None)
+        removed_revisions = self._revisions_by_node.pop(node_id, [])
+        for revision in removed_revisions:
+            self._revision_content_manifest.pop(str(revision["revision_id"]), None)
         self._node_tags.pop(node_id, None)
         self._node_groups.pop(node_id, None)
         for edge_id, edge in list(self._edges.items()):
@@ -228,6 +233,52 @@ class InMemoryMetaStore:
     def list_revisions(self, node_id: str) -> list[Mapping[str, Any]]:
         revisions = self._revisions_by_node.get(node_id, [])
         return [dict(revision) for revision in revisions]
+
+    def get_revision_manifest(
+        self,
+        node_id: str,
+        revision_id: str,
+    ) -> list[Mapping[str, Any]]:
+        _ = self._require_revision(node_id=node_id, revision_id=revision_id)
+        content_item_ids = self._revision_content_manifest.get(revision_id, [])
+        payload: list[Mapping[str, Any]] = []
+        for position, content_item_id in enumerate(content_item_ids):
+            item = self._content_items.get(content_item_id)
+            if item is None:
+                continue
+            payload.append(
+                {
+                    "content_item_id": content_item_id,
+                    "position": position,
+                    "filename": item.get("filename"),
+                    "mime_type": item.get("mime_type"),
+                    "blob_hash": item.get("blob_hash"),
+                    "blob_size": item.get("blob_size"),
+                }
+            )
+        return payload
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]:
+        from_revision = self._require_revision(node_id=node_id, revision_id=from_revision_id)
+        to_revision = self._require_revision(node_id=node_id, revision_id=to_revision_id)
+        source_manifest = self.get_revision_manifest(node_id, from_revision_id)
+        target_manifest = self.get_revision_manifest(node_id, to_revision_id)
+        source_ids = {str(row["content_item_id"]) for row in source_manifest}
+        target_ids = {str(row["content_item_id"]) for row in target_manifest}
+        return {
+            "node_id": node_id,
+            "from_revision_id": from_revision_id,
+            "to_revision_id": to_revision_id,
+            "title_changed": str(from_revision["title"]) != str(to_revision["title"]),
+            "body_changed": str(from_revision["body"]) != str(to_revision["body"]),
+            "added_content_item_ids": sorted(target_ids - source_ids),
+            "removed_content_item_ids": sorted(source_ids - target_ids),
+        }
 
     def attach_content_item(
         self,
@@ -673,6 +724,7 @@ class InMemoryMetaStore:
         }
         revisions.append(revision_row)
         node["current_revision_id"] = next_revision_id
+        self._capture_revision_manifest(node_id=node_id, revision_id=next_revision_id)
         self.mark_node_edges_stale(node_id)
         return next_revision_id
 
@@ -875,6 +927,25 @@ class InMemoryMetaStore:
         for key in list(self._chunk_embeddings):
             if key[0] in chunk_id_set:
                 self._chunk_embeddings.pop(key, None)
+
+    def _capture_revision_manifest(self, *, node_id: str, revision_id: str) -> None:
+        rows = [
+            item
+            for item in self._content_items.values()
+            if str(item["node_id"]) == node_id and item["deleted_at"] is None
+        ]
+        rows.sort(key=lambda item: (str(item["created_at"]), str(item["content_item_id"])))
+        self._revision_content_manifest[revision_id] = [
+            str(item["content_item_id"])
+            for item in rows
+        ]
+
+    def _require_revision(self, *, node_id: str, revision_id: str) -> Mapping[str, Any]:
+        revisions = self._revisions_by_node.get(node_id, [])
+        for revision in revisions:
+            if str(revision["revision_id"]) == revision_id:
+                return dict(revision)
+        raise KeyError(f"Revision not found: {revision_id}")
 
 
 class InMemoryVectorIndex:
