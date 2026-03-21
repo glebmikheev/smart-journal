@@ -5,10 +5,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "smart-journal"
 version = "0.6.0"
-description = "Smart Journal increment 5 baseline."
+description = "Smart Journal increment 8 baseline."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "openai>=1.0.0",
+  "paddlepaddle==3.2.0",
+  "paddleocr>=3.4.0",
+  "pillow>=10.0.0",
+  "openai-whisper>=20250625",
+  "imageio-ffmpeg>=0.6.0",
   "sentence-transformers>=3.0.0",
 ]
 
