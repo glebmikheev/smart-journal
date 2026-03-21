@@ -153,6 +153,7 @@ class SQLiteMetaStore:
                 (revision_id, node_id),
             )
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
         if soft_delete:
@@ -253,6 +254,7 @@ class SQLiteMetaStore:
                 ),
             )
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
         return content_item_id
 
     def list_content_items(
@@ -306,6 +308,7 @@ class SQLiteMetaStore:
                     (timestamp, content_item_id),
                 )
                 self._refresh_node_search_index(node_id)
+                self.mark_node_edges_stale(node_id)
             return
 
         with self._connection:
@@ -318,6 +321,7 @@ class SQLiteMetaStore:
                 (content_item_id,),
             )
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
 
     def set_content_item_extraction(
         self,
@@ -409,6 +413,7 @@ class SQLiteMetaStore:
                         _utc_now(),
                     ),
                 )
+            self.mark_node_edges_stale(node_id)
         return created_ids
 
     def list_chunks(
@@ -765,6 +770,60 @@ class SQLiteMetaStore:
                 (next_status, next_weight, _utc_now(), edge_id),
             )
 
+    def mark_node_edges_stale(self, node_id: str) -> int:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        timestamp = _utc_now()
+        if self._connection.in_transaction:
+            return self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+        with self._connection:
+            return self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+
+    def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+
+        row = self._connection.execute(
+            """
+            SELECT revision_id, title, body
+            FROM revisions
+            WHERE revision_id = ? AND node_id = ?
+            """,
+            (revision_id, node_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+
+        next_revision_no = int(self._next_revision_no(node_id))
+        timestamp = _utc_now()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE nodes
+                SET title = ?,
+                    body = ?,
+                    updated_at = ?
+                WHERE node_id = ?
+                """,
+                (str(row["title"]), str(row["body"]), timestamp, node_id),
+            )
+            next_revision_id = self._insert_revision(
+                node_id=node_id,
+                revision_no=next_revision_no,
+                title=str(row["title"]),
+                body=str(row["body"]),
+                comment=f"rollback:{revision_id}",
+            )
+            self._connection.execute(
+                "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
+                (next_revision_id, node_id),
+            )
+            self._refresh_node_search_index(node_id)
+            self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+        return next_revision_id
+
     def create_tag(self, graph_id: str, name: str) -> str:
         self._require_live_graph(graph_id)
         tag_id = str(uuid4())
@@ -986,6 +1045,37 @@ class SQLiteMetaStore:
             item["score"] = float(raw_score) if raw_score is not None else 0.0
             payload.append(item)
         return payload
+
+    def _mark_node_edges_stale_no_transaction(self, *, node_id: str, timestamp: str) -> int:
+        changed_rows = 0
+        association_cursor = self._connection.execute(
+            """
+            UPDATE edges
+            SET status = 'possibly_stale',
+                updated_at = ?
+            WHERE deleted_at IS NULL
+              AND edge_type = 'association'
+              AND status NOT IN ('rejected', 'possibly_stale')
+              AND (from_node_id = ? OR to_node_id = ?)
+            """,
+            (timestamp, node_id, node_id),
+        )
+        changed_rows += int(association_cursor.rowcount or 0)
+
+        semantic_cursor = self._connection.execute(
+            """
+            UPDATE edges
+            SET status = 'stale',
+                updated_at = ?
+            WHERE deleted_at IS NULL
+              AND edge_type IN ('semantic', 'implication')
+              AND status NOT IN ('rejected', 'stale')
+              AND (from_node_id = ? OR to_node_id = ?)
+            """,
+            (timestamp, node_id, node_id),
+        )
+        changed_rows += int(semantic_cursor.rowcount or 0)
+        return changed_rows
 
     def _initialize_schema(self) -> None:
         self._connection.executescript(

@@ -178,6 +178,7 @@ class InMemoryMetaStore:
             }
         )
         node["current_revision_id"] = revision_id
+        self.mark_node_edges_stale(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
         node = self._nodes.get(node_id)
@@ -256,6 +257,7 @@ class InMemoryMetaStore:
             "deleted_at": None,
         }
         self._chunks_by_content_item.setdefault(content_item_id, [])
+        self.mark_node_edges_stale(node_id)
         return content_item_id
 
     def list_content_items(
@@ -289,10 +291,12 @@ class InMemoryMetaStore:
             for chunk in self._chunks_by_content_item.get(content_item_id, []):
                 if chunk["deleted_at"] is None:
                     chunk["deleted_at"] = deleted_at
+            self.mark_node_edges_stale(str(item["node_id"]))
             return
         self._content_items.pop(content_item_id, None)
         removed_chunks = self._chunks_by_content_item.pop(content_item_id, [])
         self._delete_embeddings_for_chunks([str(chunk["chunk_id"]) for chunk in removed_chunks])
+        self.mark_node_edges_stale(str(item["node_id"]))
 
     def set_content_item_extraction(
         self,
@@ -341,6 +345,7 @@ class InMemoryMetaStore:
             )
         self._delete_embeddings_for_chunks([str(row["chunk_id"]) for row in existing_rows])
         self._chunks_by_content_item[content_item_id] = new_rows
+        self.mark_node_edges_stale(str(item["node_id"]))
         return created_chunk_ids
 
     def list_chunks(
@@ -615,6 +620,61 @@ class InMemoryMetaStore:
         if weight is not None:
             edge["weight"] = float(weight)
         edge["updated_at"] = _utc_now()
+
+    def mark_node_edges_stale(self, node_id: str) -> int:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        changed_rows = 0
+        timestamp = _utc_now()
+        for edge in self._edges.values():
+            if edge["deleted_at"] is not None:
+                continue
+            if str(edge["from_node_id"]) != node_id and str(edge["to_node_id"]) != node_id:
+                continue
+            current_status = str(edge["status"])
+            if current_status == "rejected":
+                continue
+            edge_type = str(edge["edge_type"])
+            next_status = "possibly_stale" if edge_type == "association" else "stale"
+            if current_status == next_status:
+                continue
+            edge["status"] = next_status
+            edge["updated_at"] = timestamp
+            changed_rows += 1
+        return changed_rows
+
+    def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str:
+        node = self._nodes.get(node_id)
+        if node is None or node["deleted_at"] is not None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        revisions = self._revisions_by_node.get(node_id, [])
+        source_revision = next(
+            (row for row in revisions if str(row["revision_id"]) == revision_id),
+            None,
+        )
+        if source_revision is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+
+        timestamp = _utc_now()
+        node["title"] = str(source_revision["title"])
+        node["body"] = str(source_revision["body"])
+        node["updated_at"] = timestamp
+
+        next_revision_id = str(uuid4())
+        revision_row = {
+            "revision_id": next_revision_id,
+            "node_id": node_id,
+            "revision_no": len(revisions) + 1,
+            "title": str(source_revision["title"]),
+            "body": str(source_revision["body"]),
+            "created_at": timestamp,
+            "comment": f"rollback:{revision_id}",
+        }
+        revisions.append(revision_row)
+        node["current_revision_id"] = next_revision_id
+        self.mark_node_edges_stale(node_id)
+        return next_revision_id
 
     def create_tag(self, graph_id: str, name: str) -> str:
         if self.get_graph(graph_id) is None:
