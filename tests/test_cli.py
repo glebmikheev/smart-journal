@@ -54,6 +54,16 @@ class CliTests(unittest.TestCase):
             self.assertEqual(payload["meta_store"]["provider_id"], "sqlite")
             self.assertEqual(payload["llm_provider"]["provider_id"], "mock_chat")
 
+    def test_preflight_command_outputs_core_json(self) -> None:
+        output = io.StringIO()
+        with redirect_stdout(output):
+            exit_code = run_cli(["preflight", "--profile", "core", "--json", "--strict"])
+        self.assertEqual(exit_code, 0)
+        payload = json.loads(output.getvalue())
+        self.assertTrue(bool(payload["ok"]))
+        self.assertEqual(payload["profiles"], ["core"])
+        self.assertIn("checks", payload)
+
 
 if __name__ == "__main__":
     unittest.main()
