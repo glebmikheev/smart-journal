@@ -152,3 +152,33 @@ model = "gpt-4.1-mini"
 api_key = "sk-..."  # or use OPENAI_API_KEY env var
 timeout_seconds = 60
 ```
+
+## OpenAI Smoke Check
+
+Prerequisites:
+
+```powershell
+python -m pip install -e .[dev,ui]
+```
+
+Set API key (or pass it as `--api-key`):
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+```
+
+Run one-command smoke (chat + structured + Explore):
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_openai.py --model gpt-4.1-mini
+```
+
+Expected result: JSON with `"ok": true` and non-empty `chat_preview` / `structured_payload`.
+
+Optional:
+
+```powershell
+python scripts/smoke_openai.py --model gpt-4.1-mini --base-url https://api.openai.com/v1
+python scripts/smoke_openai.py --model gpt-4.1-mini --query "What risks connect these notes?"
+```
