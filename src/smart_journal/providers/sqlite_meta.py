@@ -642,6 +642,129 @@ class SQLiteMetaStore:
                 (_utc_now(), *unique_ids),
             )
 
+    def create_edge(
+        self,
+        *,
+        graph_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        status: str = "pending",
+        weight: float | None = None,
+    ) -> str:
+        if from_node_id == to_node_id:
+            raise ValueError("Self-loop edges are not supported in alpha.")
+        self._require_live_graph(graph_id)
+        from_node = self.get_node(from_node_id)
+        to_node = self.get_node(to_node_id)
+        if from_node is None:
+            raise KeyError(f"Node not found or deleted: {from_node_id}")
+        if to_node is None:
+            raise KeyError(f"Node not found or deleted: {to_node_id}")
+        if str(from_node["graph_id"]) != graph_id or str(to_node["graph_id"]) != graph_id:
+            raise ValueError("Edge endpoints must belong to the same graph.")
+
+        edge_id = str(uuid4())
+        timestamp = _utc_now()
+        with self._connection:
+            self._connection.execute(
+                """
+                INSERT INTO edges(
+                    edge_id,
+                    graph_id,
+                    from_node_id,
+                    to_node_id,
+                    edge_type,
+                    status,
+                    weight,
+                    created_at,
+                    updated_at,
+                    deleted_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                """,
+                (
+                    edge_id,
+                    graph_id,
+                    from_node_id,
+                    to_node_id,
+                    edge_type,
+                    _validate_edge_status(status),
+                    (float(weight) if weight is not None else None),
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        return edge_id
+
+    def get_edge(self, edge_id: str, *, include_deleted: bool = False) -> Mapping[str, Any] | None:
+        query = "SELECT * FROM edges WHERE edge_id = ?"
+        params: tuple[Any, ...] = (edge_id,)
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        row = self._connection.execute(query, params).fetchone()
+        return _row_to_dict(row) if row is not None else None
+
+    def list_edges(
+        self,
+        *,
+        graph_id: str | None = None,
+        node_id: str | None = None,
+        edge_type: str | None = None,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            return []
+
+        sql_parts = ["SELECT * FROM edges WHERE 1 = 1"]
+        params: list[Any] = []
+
+        if not include_deleted:
+            sql_parts.append("AND deleted_at IS NULL")
+        if graph_id is not None:
+            sql_parts.append("AND graph_id = ?")
+            params.append(graph_id)
+        if node_id is not None:
+            sql_parts.append("AND (from_node_id = ? OR to_node_id = ?)")
+            params.extend([node_id, node_id])
+        if edge_type is not None:
+            sql_parts.append("AND edge_type = ?")
+            params.append(edge_type)
+        if status is not None:
+            sql_parts.append("AND status = ?")
+            params.append(_validate_edge_status(status))
+
+        sql_parts.append("ORDER BY updated_at DESC, edge_id DESC LIMIT ?")
+        params.append(limit)
+        rows = self._connection.execute("\n".join(sql_parts), tuple(params)).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def update_edge(
+        self,
+        edge_id: str,
+        *,
+        status: str | None = None,
+        weight: float | None = None,
+    ) -> None:
+        edge = self.get_edge(edge_id=edge_id)
+        if edge is None:
+            raise KeyError(f"Edge not found or deleted: {edge_id}")
+        next_status = _validate_edge_status(status) if status is not None else str(edge["status"])
+        next_weight = float(weight) if weight is not None else edge["weight"]
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE edges
+                SET status = ?,
+                    weight = ?,
+                    updated_at = ?
+                WHERE edge_id = ? AND deleted_at IS NULL
+                """,
+                (next_status, next_weight, _utc_now(), edge_id),
+            )
+
     def create_tag(self, graph_id: str, name: str) -> str:
         self._require_live_graph(graph_id)
         tag_id = str(uuid4())
@@ -1225,6 +1348,15 @@ def _build_fts_query(raw_query: str) -> str:
     if not quoted:
         return ""
     return " AND ".join(quoted)
+
+
+def _validate_edge_status(status: str) -> str:
+    normalized = status.strip().lower()
+    allowed = {"pending", "accepted", "rejected", "stale", "possibly_stale"}
+    if normalized not in allowed:
+        known = ", ".join(sorted(allowed))
+        raise ValueError(f"Unsupported edge status '{status}'. Known statuses: {known}")
+    return normalized
 
 
 def _utc_now() -> str:
