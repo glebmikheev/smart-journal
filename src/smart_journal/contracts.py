@@ -207,6 +207,17 @@ class MetaStore(ProviderInfo, Protocol):
 
     def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str: ...
 
+    def get_revision_manifest(
+        self, node_id: str, revision_id: str
+    ) -> list[Mapping[str, Any]]: ...
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]: ...
+
     def create_tag(self, graph_id: str, name: str) -> str: ...
 
     def list_tags(

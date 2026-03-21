@@ -119,6 +119,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
             self._refresh_node_search_index(node_id)
         return node_id
 
@@ -152,6 +153,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
             self._refresh_node_search_index(node_id)
             self.mark_node_edges_stale(node_id)
 
@@ -206,6 +208,52 @@ class SQLiteMetaStore:
         ).fetchall()
         payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
         return payload
+
+    def get_revision_manifest(
+        self,
+        node_id: str,
+        revision_id: str,
+    ) -> list[Mapping[str, Any]]:
+        _ = self._require_revision(node_id=node_id, revision_id=revision_id)
+        rows = self._connection.execute(
+            """
+            SELECT
+                rcm.content_item_id,
+                rcm.position,
+                ci.filename,
+                ci.mime_type,
+                ci.blob_hash,
+                ci.blob_size
+            FROM revision_content_manifest rcm
+            INNER JOIN content_items ci ON ci.content_item_id = rcm.content_item_id
+            WHERE rcm.revision_id = ?
+            ORDER BY rcm.position ASC
+            """,
+            (revision_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]:
+        from_revision = self._require_revision(node_id=node_id, revision_id=from_revision_id)
+        to_revision = self._require_revision(node_id=node_id, revision_id=to_revision_id)
+        source_manifest = self.get_revision_manifest(node_id, from_revision_id)
+        target_manifest = self.get_revision_manifest(node_id, to_revision_id)
+        source_ids = {str(row["content_item_id"]) for row in source_manifest}
+        target_ids = {str(row["content_item_id"]) for row in target_manifest}
+        return {
+            "node_id": node_id,
+            "from_revision_id": from_revision_id,
+            "to_revision_id": to_revision_id,
+            "title_changed": str(from_revision["title"]) != str(to_revision["title"]),
+            "body_changed": str(from_revision["body"]) != str(to_revision["body"]),
+            "added_content_item_ids": sorted(target_ids - source_ids),
+            "removed_content_item_ids": sorted(source_ids - target_ids),
+        }
 
     def attach_content_item(
         self,
@@ -820,6 +868,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (next_revision_id, node_id),
             )
+            self._capture_revision_manifest(node_id=node_id, revision_id=next_revision_id)
             self._refresh_node_search_index(node_id)
             self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
         return next_revision_id
@@ -1118,6 +1167,16 @@ class SQLiteMetaStore:
             );
             CREATE INDEX IF NOT EXISTS idx_revisions_node_id ON revisions(node_id);
 
+            CREATE TABLE IF NOT EXISTS revision_content_manifest(
+                revision_id TEXT NOT NULL REFERENCES revisions(revision_id) ON DELETE CASCADE,
+                content_item_id TEXT NOT NULL
+                    REFERENCES content_items(content_item_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(revision_id, content_item_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_revision_content_manifest_revision
+                ON revision_content_manifest(revision_id, position);
+
             CREATE TABLE IF NOT EXISTS content_items(
                 content_item_id TEXT PRIMARY KEY,
                 node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
@@ -1358,6 +1417,43 @@ class SQLiteMetaStore:
         if row is None:
             return 1
         return int(row["max_revision_no"]) + 1
+
+    def _capture_revision_manifest(self, *, node_id: str, revision_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM revision_content_manifest WHERE revision_id = ?",
+            (revision_id,),
+        )
+        rows = self._connection.execute(
+            """
+            SELECT content_item_id
+            FROM content_items
+            WHERE node_id = ?
+              AND deleted_at IS NULL
+            ORDER BY created_at ASC, content_item_id ASC
+            """,
+            (node_id,),
+        ).fetchall()
+        for position, row in enumerate(rows):
+            self._connection.execute(
+                """
+                INSERT INTO revision_content_manifest(revision_id, content_item_id, position)
+                VALUES (?, ?, ?)
+                """,
+                (revision_id, str(row["content_item_id"]), position),
+            )
+
+    def _require_revision(self, *, node_id: str, revision_id: str) -> Mapping[str, Any]:
+        row = self._connection.execute(
+            """
+            SELECT revision_id, node_id, revision_no, title, body, created_at, comment
+            FROM revisions
+            WHERE node_id = ? AND revision_id = ?
+            """,
+            (node_id, revision_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+        return _row_to_dict(row)
 
     def _require_live_graph(self, graph_id: str) -> None:
         graph = self.get_graph(graph_id)
