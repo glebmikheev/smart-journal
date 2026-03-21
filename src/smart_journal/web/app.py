@@ -15,6 +15,7 @@ from pydantic import BaseModel, Field
 
 from smart_journal.config import load_config
 from smart_journal.contracts import ProviderInfo
+from smart_journal.explore import ExploreService
 from smart_journal.factories import ComponentBundle, ComponentFactory
 from smart_journal.ingestion import IngestionPipeline, build_default_ingestion_pipeline
 from smart_journal.registry import ProviderRegistry, build_default_registry
@@ -108,6 +109,16 @@ class SemanticRecomputeRequest(BaseModel):
 
 class EdgeStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=32)
+
+
+class ExploreRunRequest(BaseModel):
+    query: str = Field(min_length=1)
+    graph_id: str = Field(min_length=1)
+    group_id: str | None = None
+    top_k_chunks: int = Field(default=12, ge=1, le=200)
+    max_inferences: int = Field(default=5, ge=1, le=50)
+    create_synthesis: bool = True
+    replay_vector_ops: bool = True
 
 
 def create_app(config_path: Path | None = None) -> FastAPI:
@@ -659,6 +670,61 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             ],
             "stale_edge_ids": list(result.stale_edge_ids),
             "stale_edge_count": int(result.stale_edge_count),
+            "vector_replay": replay_stats,
+        }
+
+    @api.post("/explore/run")
+    def run_explore(payload: ExploreRunRequest, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        replay_stats: dict[str, Any] | None = None
+        try:
+            if payload.replay_vector_ops:
+                replay_stats = _replay_stats_payload(
+                    _replay_vector_index(bundle=runtime.bundle, limit=10_000)
+                )
+            service = ExploreService(
+                meta_store=runtime.bundle.meta_store,
+                vector_index=runtime.bundle.vector_index,
+                embedding_provider=runtime.bundle.embedding_provider,
+                llm_provider=runtime.bundle.llm_provider,
+            )
+            result = service.run(
+                graph_id=payload.graph_id.strip(),
+                query=payload.query,
+                group_id=(payload.group_id.strip() if payload.group_id else None),
+                top_k_chunks=payload.top_k_chunks,
+                max_inferences=payload.max_inferences,
+                create_synthesis=payload.create_synthesis,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "query": result.query,
+            "graph_id": result.graph_id,
+            "retrieval": [
+                {
+                    "chunk_id": row.chunk_id,
+                    "node_id": row.node_id,
+                    "content_item_id": row.content_item_id,
+                    "score": float(row.score),
+                    "text_preview": _preview_text(row.text),
+                    "source": row.source,
+                }
+                for row in result.retrieval
+            ],
+            "inferences": [
+                {
+                    "edge_id": row.edge_id,
+                    "from_node_id": row.from_node_id,
+                    "to_node_id": row.to_node_id,
+                    "weight": float(row.weight),
+                    "statement": row.statement,
+                    "evidence_chunk_ids": list(row.evidence_chunk_ids),
+                }
+                for row in result.inferences
+            ],
+            "synthesis_node_id": result.synthesis_node_id,
+            "llm_payload": dict(result.llm_payload),
             "vector_replay": replay_stats,
         }
 
