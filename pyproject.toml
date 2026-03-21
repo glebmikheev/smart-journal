@@ -9,6 +9,7 @@ description = "Smart Journal increment 5 baseline."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+  "openai>=1.0.0",
   "sentence-transformers>=3.0.0",
 ]
 

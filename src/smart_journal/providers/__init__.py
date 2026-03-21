@@ -11,6 +11,7 @@ from .mock import (
     PlainTextExtractor,
 )
 from .ollama import OllamaLLMProvider
+from .openai_chat import OpenAIChatProvider
 from .sqlite_meta import SQLiteMetaStore
 from .usearch_file import USearchFileVectorIndex
 
@@ -24,6 +25,7 @@ __all__ = [
     "InProcessJobQueue",
     "MockEmbeddingProvider",
     "MockLLMProvider",
+    "OpenAIChatProvider",
     "OllamaLLMProvider",
     "PlainTextExtractor",
     "SQLiteMetaStore",
