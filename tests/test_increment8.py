@@ -189,7 +189,7 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
                     "enable_audio_asr": True,
                     "ocr_lang": "deu",
                     "asr_model": "tiny",
-                    "asr_language": "en",
+                    "asr_languages": ["en", "de"],
                     "asr_device": "cpu",
                 }
             )
@@ -217,7 +217,7 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
         self.assertEqual(call_args.args[0], audio_payload)
         self.assertEqual(call_args.kwargs["mime_type"], "audio/wav")
         self.assertEqual(call_args.kwargs["model"], "tiny")
-        self.assertEqual(call_args.kwargs["language"], "en")
+        self.assertEqual(call_args.kwargs["languages"], ["en", "de"])
         self.assertEqual(call_args.kwargs["device"], "cpu")
 
     def test_basic_extractor_skips_ocr_and_asr_when_disabled(self) -> None:
@@ -250,6 +250,39 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
 
         self.assertEqual(video_artifact.content_type, "video/metadata")
         self.assertIsNone(video_artifact.text)
+
+    def test_basic_extractor_asr_capabilities_expose_model_and_language_controls(self) -> None:
+        extractor = BasicExtractorV1(
+            {
+                "asr_model": "small",
+                "asr_languages": "en,ru",
+            }
+        )
+        capabilities = extractor.capabilities()
+
+        self.assertEqual(capabilities.get("audio_asr_model"), "small")
+        self.assertEqual(capabilities.get("audio_asr_default_model"), "small")
+        self.assertEqual(capabilities.get("audio_asr_language_mode"), "hinted")
+        self.assertEqual(
+            capabilities.get("audio_asr_configured_languages"),
+            ["en", "ru"],
+        )
+        supported_models = capabilities.get("audio_asr_supported_models")
+        self.assertIsInstance(supported_models, list)
+        assert isinstance(supported_models, list)
+        self.assertIn("small", supported_models)
+
+    def test_basic_extractor_defaults_to_small_model_with_auto_language(self) -> None:
+        extractor = BasicExtractorV1()
+        capabilities = extractor.capabilities()
+        self.assertEqual(capabilities.get("audio_asr_model"), "small")
+        self.assertEqual(capabilities.get("audio_asr_language_mode"), "auto")
+        self.assertEqual(capabilities.get("audio_asr_configured_languages"), [])
+
+    def test_basic_extractor_keeps_legacy_single_asr_language_option(self) -> None:
+        extractor = BasicExtractorV1({"asr_language": "fr"})
+        capabilities = extractor.capabilities()
+        self.assertEqual(capabilities.get("audio_asr_configured_languages"), ["fr"])
 
 
 if __name__ == "__main__":

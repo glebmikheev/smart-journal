@@ -128,8 +128,8 @@ backend = "basic_v1"
 enable_image_ocr = true
 enable_audio_asr = true
 ocr_lang = "eng"
-asr_model = "base"
-# asr_language = "en"
+asr_model = "small"
+# asr_languages = ["en", "ru"]  # optional language hints; omit for auto-detect
 # asr_device = "cpu"
 
 [embedding_provider]

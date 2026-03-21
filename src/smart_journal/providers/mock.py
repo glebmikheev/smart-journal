@@ -1124,8 +1124,12 @@ class BasicExtractorV1:
         self._enable_image_ocr = _read_bool_option(options, "enable_image_ocr", default=True)
         self._enable_audio_asr = _read_bool_option(options, "enable_audio_asr", default=True)
         self._ocr_lang = str(options.get("ocr_lang", "eng")).strip() or "eng"
-        self._asr_model = str(options.get("asr_model", "base")).strip() or "base"
-        self._asr_language = str(options.get("asr_language", "")).strip() or None
+        self._asr_model = str(options.get("asr_model", "small")).strip() or "small"
+        self._asr_languages = _read_language_codes_option(options, "asr_languages")
+        if not self._asr_languages:
+            legacy_language = str(options.get("asr_language", "")).strip().lower()
+            if legacy_language:
+                self._asr_languages = [legacy_language]
         self._asr_device = str(options.get("asr_device", "")).strip() or None
         self._supported_mime_types = (
             self._text_mimes
@@ -1149,6 +1153,13 @@ class BasicExtractorV1:
             "outputs": ["text", "thumbnail", "metadata"],
             "ocr_enabled": self._enable_image_ocr,
             "audio_asr_enabled": self._enable_audio_asr,
+            "audio_asr_backend": "whisper",
+            "audio_asr_model": self._asr_model,
+            "audio_asr_default_model": "small",
+            "audio_asr_supported_models": _whisper_supported_models(),
+            "audio_asr_language_mode": ("auto" if not self._asr_languages else "hinted"),
+            "audio_asr_configured_languages": list(self._asr_languages),
+            "audio_asr_supported_languages": _whisper_supported_language_codes(),
         }
 
     def supports_mime(self, mime_type: str) -> bool:
@@ -1200,7 +1211,7 @@ class BasicExtractorV1:
                     content,
                     mime_type=mime_type,
                     model=self._asr_model,
-                    language=self._asr_language,
+                    languages=self._asr_languages,
                     device=self._asr_device,
                 )
                 transcript = asr_text
@@ -1246,6 +1257,29 @@ def _read_bool_option(
     return default
 
 
+def _read_language_codes_option(options: Mapping[str, Any], key: str) -> list[str]:
+    raw_value = options.get(key)
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        candidates = [part for part in re.split(r"[,;\s]+", raw_value) if part]
+    elif isinstance(raw_value, Sequence) and not isinstance(raw_value, str | bytes | bytearray):
+        candidates = [str(part) for part in raw_value]
+    else:
+        candidates = [str(raw_value)]
+
+    seen: set[str] = set()
+    normalized_values: list[str] = []
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_values.append(normalized)
+    return normalized_values
+
+
 def _run_image_ocr(content: bytes, *, lang: str) -> tuple[str, dict[str, str]]:
     lang_id = lang.strip() or "eng"
     metadata = {
@@ -1278,17 +1312,19 @@ def _run_audio_asr(
     *,
     mime_type: str,
     model: str,
-    language: str | None = None,
+    languages: Sequence[str] | None = None,
     device: str | None = None,
 ) -> tuple[str, dict[str, str]]:
-    model_id = model.strip() or "base"
+    model_id = model.strip() or "small"
+    language_hints = [lang.strip().lower() for lang in (languages or []) if lang.strip()]
     metadata = {
         "asr_status": "attempted",
         "asr_backend": "whisper",
         "asr_model": model_id,
+        "asr_language_mode": ("auto" if not language_hints else "hinted"),
     }
-    if language:
-        metadata["asr_language"] = language
+    if language_hints:
+        metadata["asr_language_hints"] = ",".join(language_hints)
     if device:
         metadata["asr_device"] = device
     try:
@@ -1313,17 +1349,46 @@ def _run_audio_asr(
             load_kwargs["device"] = device
         whisper_model = whisper_module.load_model(model_id, **load_kwargs)
 
-        transcribe_kwargs: dict[str, str] = {}
-        if language:
-            transcribe_kwargs["language"] = language
-        raw_result = whisper_model.transcribe(temp_path, **transcribe_kwargs)
-        result_text = ""
-        if isinstance(raw_result, Mapping):
-            result_text = str(raw_result.get("text", "")).strip()
+        raw_result: Any
+        if not language_hints:
+            raw_result = whisper_model.transcribe(temp_path)
         else:
-            result_text = str(raw_result).strip()
+            best_result: Any = None
+            best_score = float("-inf")
+            best_language: str | None = None
+            candidate_errors: list[str] = []
+            for hinted_language in language_hints:
+                try:
+                    candidate = whisper_model.transcribe(
+                        temp_path,
+                        language=hinted_language,
+                    )
+                except Exception as candidate_error:  # noqa: BLE001
+                    candidate_errors.append(
+                        f"{hinted_language}:{_format_error(candidate_error, max_length=96)}"
+                    )
+                    continue
+                candidate_score = _score_whisper_result(candidate)
+                if candidate_score > best_score:
+                    best_result = candidate
+                    best_score = candidate_score
+                    best_language = hinted_language
+
+            if best_result is None:
+                raise RuntimeError(
+                    "Whisper failed for all configured language hints."
+                )
+            raw_result = best_result
+            if best_language:
+                metadata["asr_selected_language"] = best_language
+            if candidate_errors:
+                metadata["asr_hint_errors"] = "; ".join(candidate_errors)
+
+        result_text, detected_language = _extract_whisper_result_text_and_language(raw_result)
         metadata["asr_status"] = "ok"
         metadata["asr_text_length"] = str(len(result_text))
+        if detected_language:
+            metadata["asr_detected_language"] = detected_language
         return result_text, metadata
     except Exception as error:  # noqa: BLE001
         metadata["asr_status"] = "error"
@@ -1342,6 +1407,88 @@ def _audio_suffix_for_mime(mime_type: str) -> str:
         "audio/ogg": ".ogg",
     }
     return mime_to_suffix.get(mime_type, ".audio")
+
+
+def _whisper_supported_models() -> list[str]:
+    return [
+        "tiny",
+        "tiny.en",
+        "base",
+        "base.en",
+        "small",
+        "small.en",
+        "medium",
+        "medium.en",
+        "large-v1",
+        "large-v2",
+        "large-v3",
+        "large",
+        "turbo",
+    ]
+
+
+def _whisper_supported_language_codes() -> list[str]:
+    try:
+        tokenizer_module = importlib.import_module("whisper.tokenizer")
+        raw_languages = getattr(tokenizer_module, "LANGUAGES", {})
+        if isinstance(raw_languages, Mapping):
+            return sorted(
+                str(code)
+                for code in raw_languages.keys()
+                if str(code).strip()
+            )
+    except Exception:
+        pass
+    return [
+        "de",
+        "en",
+        "es",
+        "fr",
+        "it",
+        "ja",
+        "ko",
+        "pt",
+        "ru",
+        "uk",
+        "zh",
+    ]
+
+
+def _extract_whisper_result_text_and_language(raw_result: Any) -> tuple[str, str | None]:
+    if isinstance(raw_result, Mapping):
+        text = str(raw_result.get("text", "")).strip()
+        detected = str(raw_result.get("language", "")).strip().lower() or None
+        return text, detected
+    return str(raw_result).strip(), None
+
+
+def _score_whisper_result(raw_result: Any) -> float:
+    text, _ = _extract_whisper_result_text_and_language(raw_result)
+    score = min(float(len(text)) / 600.0, 1.0)
+    if not isinstance(raw_result, Mapping):
+        return score
+
+    raw_segments = raw_result.get("segments")
+    if not isinstance(raw_segments, Sequence) or isinstance(raw_segments, str | bytes | bytearray):
+        return score
+
+    avg_logprobs: list[float] = []
+    no_speech_probs: list[float] = []
+    for segment in raw_segments:
+        if not isinstance(segment, Mapping):
+            continue
+        avg_logprob = segment.get("avg_logprob")
+        no_speech_prob = segment.get("no_speech_prob")
+        if isinstance(avg_logprob, int | float):
+            avg_logprobs.append(float(avg_logprob))
+        if isinstance(no_speech_prob, int | float):
+            no_speech_probs.append(float(no_speech_prob))
+
+    if avg_logprobs:
+        score += sum(avg_logprobs) / float(len(avg_logprobs))
+    if no_speech_probs:
+        score -= sum(no_speech_probs) / float(len(no_speech_probs))
+    return score
 
 
 def _format_error(error: Exception, *, max_length: int = 240) -> str:
