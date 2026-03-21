@@ -254,6 +254,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 include_deleted=include_deleted,
             )
             tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=include_deleted)
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=graph_id,
+                include_deleted=include_deleted,
+                limit=1_000,
+            )
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
 
@@ -288,9 +293,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 for tag in tags
             ],
             "edges": {
-                "supported": False,
-                "items": [],
-                "note": "Edge APIs are planned for future increments.",
+                "supported": True,
+                "count": len(edges),
+                "by_type": _count_by_key(edges, "edge_type"),
+                "by_status": _count_by_key(edges, "status"),
+                "items": [_edge_payload(edge) for edge in edges],
             },
         }
 
@@ -311,6 +318,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 include_deleted=include_deleted,
             )
             tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=include_deleted)
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=graph_id,
+                include_deleted=include_deleted,
+                limit=1_000,
+            )
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
 
@@ -364,9 +376,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 "tag_membership": tag_links,
             },
             "edges": {
-                "supported": False,
-                "items": [],
-                "note": "Edge APIs are planned for future increments.",
+                "supported": True,
+                "count": len(edges),
+                "by_type": _count_by_key(edges, "edge_type"),
+                "by_status": _count_by_key(edges, "status"),
+                "items": [_edge_payload(edge) for edge in edges],
             },
         }
 
@@ -525,6 +539,12 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             )
             tags = runtime.bundle.meta_store.list_node_tags(node_id)
             groups = runtime.bundle.meta_store.list_node_groups(node_id)
+            edges = runtime.bundle.meta_store.list_edges(
+                graph_id=str(node["graph_id"]),
+                node_id=node_id,
+                include_deleted=include_deleted,
+                limit=1_000,
+            )
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
 
@@ -549,9 +569,11 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             "tags": [_to_dict(tag) for tag in tags],
             "groups": [_to_dict(group) for group in groups],
             "relationships": {
-                "supported": False,
-                "items": [],
-                "note": "Relationship APIs are planned for future increments.",
+                "supported": True,
+                "count": len(edges),
+                "by_type": _count_by_key(edges, "edge_type"),
+                "by_status": _count_by_key(edges, "status"),
+                "items": [_node_relationship_payload(edge=edge, node_id=node_id) for edge in edges],
             },
         }
 
@@ -1201,6 +1223,47 @@ def _error_text(error: Exception) -> str:
 
 def _to_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {str(key): value for key, value in payload.items()}
+
+
+def _count_by_key(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]:
+    counts: dict[str, int] = {}
+    for row in rows:
+        value = row.get(key)
+        if value is None:
+            continue
+        normalized = str(value).strip()
+        if not normalized:
+            continue
+        counts[normalized] = counts.get(normalized, 0) + 1
+    return counts
+
+
+def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
+    payload = _to_dict(edge)
+    provenance = payload.get("provenance")
+    if isinstance(provenance, Mapping):
+        payload["provenance"] = _to_dict(provenance)
+    else:
+        payload["provenance"] = {}
+    return payload
+
+
+def _node_relationship_payload(*, edge: Mapping[str, Any], node_id: str) -> dict[str, Any]:
+    payload = _edge_payload(edge)
+    from_node_id = str(payload.get("from_node_id", ""))
+    to_node_id = str(payload.get("to_node_id", ""))
+    if from_node_id == node_id and to_node_id == node_id:
+        direction = "self"
+        other_node_id = node_id
+    elif from_node_id == node_id:
+        direction = "outgoing"
+        other_node_id = to_node_id
+    else:
+        direction = "incoming"
+        other_node_id = from_node_id
+    payload["direction"] = direction
+    payload["other_node_id"] = other_node_id
+    return payload
 
 
 def _selected_providers_payload(bundle: ComponentBundle) -> dict[str, dict[str, Any]]:
