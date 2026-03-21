@@ -262,6 +262,82 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             },
         }
 
+    @api.get("/graphs/{graph_id}/topology")
+    def get_graph_topology(
+        graph_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        graph = runtime.bundle.meta_store.get_graph(graph_id, include_deleted=include_deleted)
+        if graph is None:
+            raise HTTPException(status_code=404, detail=f"Graph not found: {graph_id}")
+        try:
+            nodes = runtime.bundle.meta_store.list_nodes(graph_id, include_deleted=include_deleted)
+            groups = runtime.bundle.meta_store.list_groups(
+                graph_id,
+                include_deleted=include_deleted,
+            )
+            tags = runtime.bundle.meta_store.list_tags(graph_id, include_deleted=include_deleted)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+
+        group_counts = {str(group["group_id"]): 0 for group in groups}
+        tag_counts = {str(tag["tag_id"]): 0 for tag in tags}
+        group_links: list[dict[str, str]] = []
+        tag_links: list[dict[str, str]] = []
+        node_items: list[dict[str, Any]] = []
+
+        for node in nodes:
+            node_id = str(node["node_id"])
+            node_groups = runtime.bundle.meta_store.list_node_groups(node_id)
+            node_tags = runtime.bundle.meta_store.list_node_tags(node_id)
+            group_ids = [str(group["group_id"]) for group in node_groups]
+            tag_ids = [str(tag["tag_id"]) for tag in node_tags]
+            for group_id in group_ids:
+                if group_id in group_counts:
+                    group_counts[group_id] += 1
+                group_links.append({"group_id": group_id, "node_id": node_id})
+            for tag_id in tag_ids:
+                if tag_id in tag_counts:
+                    tag_counts[tag_id] += 1
+                tag_links.append({"tag_id": tag_id, "node_id": node_id})
+            node_items.append(
+                {
+                    **_to_dict(node),
+                    "group_ids": group_ids,
+                    "tag_ids": tag_ids,
+                }
+            )
+
+        return {
+            "graph": _to_dict(graph),
+            "nodes": node_items,
+            "groups": [
+                {
+                    **_to_dict(group),
+                    "node_count": group_counts.get(str(group["group_id"]), 0),
+                }
+                for group in groups
+            ],
+            "tags": [
+                {
+                    **_to_dict(tag),
+                    "node_count": tag_counts.get(str(tag["tag_id"]), 0),
+                }
+                for tag in tags
+            ],
+            "links": {
+                "group_membership": group_links,
+                "tag_membership": tag_links,
+            },
+            "edges": {
+                "supported": False,
+                "items": [],
+                "note": "Edge APIs are planned for future increments.",
+            },
+        }
+
     @api.get("/graphs/{graph_id}/nodes")
     def list_graph_nodes(
         graph_id: str,
