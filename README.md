@@ -21,8 +21,9 @@ Increment 8 baseline for the Smart Journal knowledge base (with API hardening).
 - extractor backend `basic_v1`:
   - plain text / markdown
   - PDF -> text
-  - image -> thumbnail metadata (no OCR)
-  - audio/video -> metadata-only (alpha)
+  - image -> thumbnail metadata + optional OCR text (best-effort)
+  - audio -> metadata + optional ASR transcript (best-effort)
+  - video -> metadata-only (video OCR/ASR tracked in `TODO.md`)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
 - incremental embedding sync by chunk checksum (recompute only changed chunks)
 - real embedding backend `multilingual_e5_small` (Sentence Transformers)
@@ -123,6 +124,14 @@ backend = "in_process"
 [extractor]
 backend = "basic_v1"
 
+# Optional multimodal extraction controls
+enable_image_ocr = true
+enable_audio_asr = true
+ocr_lang = "eng"
+asr_model = "base"
+# asr_language = "en"
+# asr_device = "cpu"
+
 [embedding_provider]
 backend = "multilingual_e5_small"
 device = "cpu"
@@ -182,3 +191,7 @@ Optional:
 python scripts/smoke_openai.py --model gpt-4.1-mini --base-url https://api.openai.com/v1
 python scripts/smoke_openai.py --model gpt-4.1-mini --query "What risks connect these notes?"
 ```
+
+## Backlog
+
+Pending multimodal work (video + medium/heavy levels) is tracked in `TODO.md`.

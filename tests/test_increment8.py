@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from smart_journal.explore import ExploreService
 from smart_journal.ingestion import IngestionPipeline, build_default_ingestion_pipeline
@@ -168,6 +169,87 @@ class IncrementEightAcceptanceTests(unittest.TestCase):
         )
         self.assertIsInstance(pipeline, IngestionPipeline)
         pipeline.ingest_content_item_now(content_item_id)
+
+
+class IncrementEightMultimodalExtractorTests(unittest.TestCase):
+    def test_basic_extractor_runs_ocr_and_asr_when_enabled(self) -> None:
+        with (
+            mock.patch(
+                "smart_journal.providers.mock._run_image_ocr",
+                return_value=("detected image text", {"ocr_status": "ok"}),
+            ) as run_ocr,
+            mock.patch(
+                "smart_journal.providers.mock._run_audio_asr",
+                return_value=("detected transcript", {"asr_status": "ok"}),
+            ) as run_asr,
+        ):
+            extractor = BasicExtractorV1(
+                {
+                    "enable_image_ocr": True,
+                    "enable_audio_asr": True,
+                    "ocr_lang": "deu",
+                    "asr_model": "tiny",
+                    "asr_language": "en",
+                    "asr_device": "cpu",
+                }
+            )
+            image_payload = b"\x89PNG\r\n"
+            audio_payload = b"RIFF...."
+            image_artifact = extractor.extract(image_payload, mime_type="image/png")
+            audio_artifact = extractor.extract(audio_payload, mime_type="audio/wav")
+
+        self.assertEqual(image_artifact.content_type, "image/thumbnail")
+        self.assertEqual(image_artifact.text, "detected image text")
+        self.assertIsNotNone(image_artifact.metadata)
+        assert image_artifact.metadata is not None
+        self.assertEqual(image_artifact.metadata.get("ocr_status"), "ok")
+        run_ocr.assert_called_once_with(image_payload, lang="deu")
+
+        self.assertEqual(audio_artifact.content_type, "audio/metadata")
+        self.assertEqual(audio_artifact.text, "detected transcript")
+        self.assertIsNotNone(audio_artifact.metadata)
+        assert audio_artifact.metadata is not None
+        self.assertEqual(audio_artifact.metadata.get("asr_status"), "ok")
+        run_asr.assert_called_once()
+        call_args = run_asr.call_args
+        self.assertIsNotNone(call_args)
+        assert call_args is not None
+        self.assertEqual(call_args.args[0], audio_payload)
+        self.assertEqual(call_args.kwargs["mime_type"], "audio/wav")
+        self.assertEqual(call_args.kwargs["model"], "tiny")
+        self.assertEqual(call_args.kwargs["language"], "en")
+        self.assertEqual(call_args.kwargs["device"], "cpu")
+
+    def test_basic_extractor_skips_ocr_and_asr_when_disabled(self) -> None:
+        with (
+            mock.patch("smart_journal.providers.mock._run_image_ocr") as run_ocr,
+            mock.patch("smart_journal.providers.mock._run_audio_asr") as run_asr,
+        ):
+            extractor = BasicExtractorV1(
+                {
+                    "enable_image_ocr": False,
+                    "enable_audio_asr": False,
+                }
+            )
+            image_artifact = extractor.extract(b"image", mime_type="image/jpeg")
+            audio_artifact = extractor.extract(b"audio", mime_type="audio/mpeg")
+            video_artifact = extractor.extract(b"video", mime_type="video/mp4")
+
+        run_ocr.assert_not_called()
+        run_asr.assert_not_called()
+
+        self.assertIsNone(image_artifact.text)
+        self.assertIsNotNone(image_artifact.metadata)
+        assert image_artifact.metadata is not None
+        self.assertEqual(image_artifact.metadata.get("ocr_status"), "disabled")
+
+        self.assertIsNone(audio_artifact.text)
+        self.assertIsNotNone(audio_artifact.metadata)
+        assert audio_artifact.metadata is not None
+        self.assertEqual(audio_artifact.metadata.get("asr_status"), "disabled")
+
+        self.assertEqual(video_artifact.content_type, "video/metadata")
+        self.assertIsNone(video_artifact.text)
 
 
 if __name__ == "__main__":
