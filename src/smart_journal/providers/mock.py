@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
 from collections import deque
@@ -588,6 +589,9 @@ class InMemoryMetaStore:
         edge_type: str,
         status: str = "pending",
         weight: float | None = None,
+        subtype: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> str:
         if from_node_id == to_node_id:
             raise ValueError("Self-loop edges are not supported in alpha.")
@@ -611,8 +615,13 @@ class InMemoryMetaStore:
             "from_node_id": from_node_id,
             "to_node_id": to_node_id,
             "edge_type": edge_type,
+            "subtype": (subtype.strip() if subtype is not None and subtype.strip() else None),
             "status": next_status,
             "weight": (float(weight) if weight is not None else None),
+            "provenance": _normalize_provenance(provenance),
+            "created_by": (
+                created_by.strip() if created_by is not None and created_by.strip() else None
+            ),
             "created_at": timestamp,
             "updated_at": timestamp,
             "deleted_at": None,
@@ -662,6 +671,7 @@ class InMemoryMetaStore:
         *,
         status: str | None = None,
         weight: float | None = None,
+        provenance: Mapping[str, Any] | None = None,
     ) -> None:
         edge = self._edges.get(edge_id)
         if edge is None or edge["deleted_at"] is not None:
@@ -670,6 +680,8 @@ class InMemoryMetaStore:
             edge["status"] = _validate_edge_status(status)
         if weight is not None:
             edge["weight"] = float(weight)
+        if provenance is not None:
+            edge["provenance"] = _normalize_provenance(provenance)
         edge["updated_at"] = _utc_now()
 
     def mark_node_edges_stale(self, node_id: str) -> int:
@@ -1268,6 +1280,16 @@ def _validate_edge_status(status: str) -> str:
         known = ", ".join(sorted(allowed))
         raise ValueError(f"Unsupported edge status '{status}'. Known statuses: {known}")
     return normalized
+
+
+def _normalize_provenance(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    raw = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
+    loaded = json.loads(raw)
+    if isinstance(loaded, dict):
+        return {str(key): value for key, value in loaded.items()}
+    return {}
 
 
 def _cosine_similarity(lhs: Sequence[float], rhs: Sequence[float]) -> float:
