@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 5 baseline for the Smart Journal knowledge base.
+Increment 8 baseline for the Smart Journal knowledge base (with API hardening).
 
 ## What is implemented
 
@@ -21,8 +21,9 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - extractor backend `basic_v1`:
   - plain text / markdown
   - PDF -> text
-  - image -> thumbnail metadata (no OCR)
-  - audio/video -> metadata-only (alpha)
+  - image -> thumbnail metadata + optional OCR text (PP-OCRv5 profiles with runtime switch API)
+  - audio -> metadata + optional ASR transcript (best-effort)
+  - video -> metadata-only (video OCR/ASR tracked in `TODO.md`)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
 - incremental embedding sync by chunk checksum (recompute only changed chunks)
 - real embedding backend `multilingual_e5_small` (Sentence Transformers)
@@ -37,10 +38,16 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - FTS prefix search (`te` matches `test`)
 - vector query payload enriched with chunk/node/content context
 - graph/node detail API + group/tag APIs (without edge CRUD yet)
+- graph/node detail and topology APIs now include edge payloads and aggregated edge counters
+- node-details API now includes relationship direction (`incoming`/`outgoing`/`self`)
+- Explore mode API (`/api/explore/run`) with implication provenance and optional synthesis node
+- edge status APIs (`/api/edges/{edge_id}/accept|reject|patch`)
 - startup auto-rebuild of non-durable vector index backends (e.g. `in_memory`) from embeddings
 - FTS5 full-text search index in SQLite meta store
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
+- optional local real LLM provider backend: `ollama_chat` (kept optional; default remains `mock_chat`)
+- optional cloud LLM provider backend: `openai_chat` (OpenAI SDK)
 - config-driven provider selection through factories
 - mock/in-memory providers kept for testing and fallback
 - CLI that can list providers and start an app shell
@@ -52,6 +59,14 @@ Increment 5 baseline for the Smart Journal knowledge base.
 python -m pip install -e .[dev]
 smart-journal providers
 smart-journal run
+```
+
+Default install includes OCR/ASR/OpenAI runtime dependencies.
+If you need a minimal install, exclude dependency resolution explicitly:
+
+```powershell
+python -m pip install -e . --no-deps
+python -m pip install sentence-transformers
 ```
 
 Run web API:
@@ -117,6 +132,19 @@ backend = "in_process"
 [extractor]
 backend = "basic_v1"
 
+# Optional multimodal extraction controls
+enable_image_ocr = true
+enable_audio_asr = true
+ocr_backend = "ppocr_v5"
+ocr_profile = "mobile_optional"
+ocr_device = "cpu"
+# ocr_languages = ["en", "ru"]  # optional language hints
+# ocr_strict_language = false
+# ocr_lang = "eng"              # legacy fallback if ocr_languages is omitted
+asr_model = "small"
+# asr_languages = ["en", "ru"]  # optional language hints; omit for auto-detect
+# asr_device = "cpu"
+
 [embedding_provider]
 backend = "multilingual_e5_small"
 device = "cpu"
@@ -126,3 +154,129 @@ batch_size = 32
 [llm_provider]
 backend = "mock_chat"
 ```
+
+Runtime OCR profile API:
+
+- `GET /api/ocr/profiles` - list profiles and active profile.
+- `POST /api/ocr/active` with `{"profile":"server"}` - switch active OCR profile.
+
+## Preflight Check
+
+Run dependency checks before smoke/live runs:
+
+```powershell
+smart-journal preflight --json
+smart-journal preflight --profile ocr --profile asr --profile llm --strict --json
+```
+
+PP-OCRv5 prerequisites (optional, for real OCR inference):
+
+```powershell
+python -m pip install -e .
+```
+
+This project uses `PP-OCRv5` only for OCR (no `tesseract/pytesseract` backend).
+
+If your user profile directories are not writable, set local runtime caches:
+
+```powershell
+$env:PADDLE_HOME="$PWD\\.runtime\\paddle"
+$env:PADDLE_PDX_CACHE_HOME="$PWD\\.runtime\\paddlex"
+```
+
+## OCR Smoke Check
+
+Run OCR smoke with auto-generated sample image:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_ocr.py --ocr-profile mobile_optional --ocr-device cpu
+```
+
+Run OCR smoke on real local images:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_ocr.py --image .\samples\ocr1.png --image .\samples\ocr2.jpg --ocr-languages en,ru
+```
+
+Expected: JSON report with `summary.ok >= 1` and `samples[*].ocr_status == "ok"` for at least one image.
+
+## ASR Smoke Check
+
+ASR prerequisites:
+
+```powershell
+python -m pip install -e .
+ffmpeg -version
+```
+
+Run ASR smoke with auto-generated WAV sample:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_asr.py --asr-model small
+```
+
+Run ASR smoke with local audio files:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_asr.py --audio .\samples\voice1.wav --audio .\samples\voice2.mp3 --asr-languages en,ru
+```
+
+Expected: JSON report with `summary.ok >= 1` and `samples[*].asr_status == "ok"` for at least one audio file.
+
+Optional local Ollama backend:
+
+```toml
+[llm_provider]
+backend = "ollama_chat"
+base_url = "http://127.0.0.1:11434"
+model = "llama3.1:8b-instruct"
+timeout_seconds = 60
+```
+
+Optional OpenAI backend:
+
+```toml
+[llm_provider]
+backend = "openai_chat"
+model = "gpt-4.1-mini"
+api_key = "sk-..."  # or use OPENAI_API_KEY env var
+timeout_seconds = 60
+```
+
+## OpenAI Smoke Check
+
+Prerequisites:
+
+```powershell
+python -m pip install -e .[dev,ui]
+```
+
+Set API key (or pass it as `--api-key`):
+
+```powershell
+$env:OPENAI_API_KEY = "sk-..."
+```
+
+Run one-command smoke (chat + structured + Explore):
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_openai.py --model gpt-4.1-mini
+```
+
+Expected result: JSON with `"ok": true` and non-empty `chat_preview` / `structured_payload`.
+
+Optional:
+
+```powershell
+python scripts/smoke_openai.py --model gpt-4.1-mini --base-url https://api.openai.com/v1
+python scripts/smoke_openai.py --model gpt-4.1-mini --query "What risks connect these notes?"
+```
+
+## Backlog
+
+Pending multimodal work (video + medium/heavy levels) is tracked in `TODO.md`.

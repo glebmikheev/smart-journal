@@ -34,10 +34,14 @@ class RegistryTests(unittest.TestCase):
         meta_ids = [descriptor.provider_id for descriptor in registry.available("meta_store")]
         vector_ids = [descriptor.provider_id for descriptor in registry.available("vector_index")]
         extractor_ids = [descriptor.provider_id for descriptor in registry.available("extractor")]
+        llm_ids = [descriptor.provider_id for descriptor in registry.available("llm_provider")]
         self.assertIn("local_cas", blob_ids)
         self.assertIn("sqlite", meta_ids)
         self.assertIn("usearch_file", vector_ids)
         self.assertIn("basic_v1", extractor_ids)
+        self.assertIn("mock_chat", llm_ids)
+        self.assertIn("ollama_chat", llm_ids)
+        self.assertIn("openai_chat", llm_ids)
 
 
 if __name__ == "__main__":
