@@ -7,6 +7,7 @@ import {
   createNode,
   createTag,
   getGraphDetails,
+  getGraphTopology,
   getHealth,
   getNodeDetails,
   getSelectedProviders,
@@ -18,13 +19,16 @@ import {
   searchNodes,
   uploadNodeFile
 } from "./api";
+import GraphMode from "./GraphMode";
 
 function App() {
+  const [viewMode, setViewMode] = useState("graph");
   const [health, setHealth] = useState(null);
   const [providers, setProviders] = useState(null);
   const [graphs, setGraphs] = useState([]);
   const [nodes, setNodes] = useState([]);
   const [graphDetails, setGraphDetails] = useState(null);
+  const [graphTopology, setGraphTopology] = useState(null);
   const [nodeDetails, setNodeDetails] = useState(null);
   const [selectedGraphId, setSelectedGraphId] = useState("");
   const [selectedNodeId, setSelectedNodeId] = useState("");
@@ -72,6 +76,7 @@ function App() {
       setNodes([]);
       setNodeDetails(null);
       setGraphDetails(null);
+      setGraphTopology(null);
       setSelectedNodeId("");
       return;
     }
@@ -122,9 +127,14 @@ function App() {
   }
 
   async function refreshGraphContext(graphId, preferredNodeId = "") {
-    const [nodesPayload, detailsPayload] = await Promise.all([listNodes(graphId), getGraphDetails(graphId)]);
+    const [nodesPayload, detailsPayload, topologyPayload] = await Promise.all([
+      listNodes(graphId),
+      getGraphDetails(graphId),
+      getGraphTopology(graphId)
+    ]);
     setNodes(nodesPayload);
     setGraphDetails(detailsPayload);
+    setGraphTopology(topologyPayload);
     setSelectedGroupId((current) => {
       if (current && detailsPayload.groups.some((group) => group.group_id === current)) {
         return current;
@@ -201,6 +211,9 @@ function App() {
     setErrorLine("");
     await createGroup(selectedGraphId, name);
     await refreshGraphContext(selectedGraphId, selectedNodeId);
+    if (selectedNodeId) {
+      await refreshNodeDetails(selectedNodeId);
+    }
     setGroupName("");
     setStatusLine(`Group "${name}" created.`);
     setBusy(false);
@@ -219,54 +232,61 @@ function App() {
     setErrorLine("");
     await createTag(selectedGraphId, name);
     await refreshGraphContext(selectedGraphId, selectedNodeId);
+    if (selectedNodeId) {
+      await refreshNodeDetails(selectedNodeId);
+    }
     setTagName("");
     setStatusLine(`Tag "${name}" created.`);
     setBusy(false);
   }
 
   async function handleAssignGroup() {
-    if (!selectedNodeId || !selectedGroupId) {
+    if (!selectedNodeId || !selectedGroupId || !selectedGraphId) {
       return;
     }
     setBusy(true);
     setErrorLine("");
     await addNodeToGroup(selectedNodeId, selectedGroupId);
+    await refreshGraphContext(selectedGraphId, selectedNodeId);
     await refreshNodeDetails(selectedNodeId);
     setStatusLine("Group assigned to node.");
     setBusy(false);
   }
 
   async function handleAssignTag() {
-    if (!selectedNodeId || !selectedTagId) {
+    if (!selectedNodeId || !selectedTagId || !selectedGraphId) {
       return;
     }
     setBusy(true);
     setErrorLine("");
     await addNodeTag(selectedNodeId, selectedTagId);
+    await refreshGraphContext(selectedGraphId, selectedNodeId);
     await refreshNodeDetails(selectedNodeId);
     setStatusLine("Tag assigned to node.");
     setBusy(false);
   }
 
   async function handleRemoveGroup(groupId) {
-    if (!selectedNodeId) {
+    if (!selectedNodeId || !selectedGraphId) {
       return;
     }
     setBusy(true);
     setErrorLine("");
     await removeNodeFromGroup(selectedNodeId, groupId);
+    await refreshGraphContext(selectedGraphId, selectedNodeId);
     await refreshNodeDetails(selectedNodeId);
     setStatusLine("Group removed from node.");
     setBusy(false);
   }
 
   async function handleRemoveTag(tagId) {
-    if (!selectedNodeId) {
+    if (!selectedNodeId || !selectedGraphId) {
       return;
     }
     setBusy(true);
     setErrorLine("");
     await removeNodeTag(selectedNodeId, tagId);
+    await refreshGraphContext(selectedGraphId, selectedNodeId);
     await refreshNodeDetails(selectedNodeId);
     setStatusLine("Tag removed from node.");
     setBusy(false);
@@ -338,8 +358,8 @@ function App() {
     <div className="page-shell">
       <header className="hero">
         <p className="hero-kicker">Smart Journal</p>
-        <h1>FastAPI + React control panel</h1>
-        <p className="hero-subtitle">Local-first knowledge graph orchestration for Increment 5+.</p>
+        <h1>Graph Workspace + Control Panel</h1>
+        <p className="hero-subtitle">Local-first knowledge graph orchestration for Increment 5+ with an interactive 2D canvas.</p>
       </header>
 
       <section className="status-strip">
@@ -362,8 +382,48 @@ function App() {
         <div className="status-line">{statusLine}</div>
       </section>
 
+      <section className="view-switch">
+        <button
+          type="button"
+          className={`mode-chip ${viewMode === "graph" ? "active" : ""}`}
+          onClick={() => setViewMode("graph")}
+        >
+          Graph View
+        </button>
+        <button
+          type="button"
+          className={`mode-chip ${viewMode === "control" ? "active" : ""}`}
+          onClick={() => setViewMode("control")}
+        >
+          Control Panel
+        </button>
+      </section>
+
       {errorLine ? <section className="error-banner">{errorLine}</section> : null}
 
+      {viewMode === "graph" ? (
+        <GraphMode
+          selectedGraphId={selectedGraphId}
+          selectedGraph={selectedGraph}
+          selectedNode={selectedNode}
+          selectedNodeId={selectedNodeId}
+          graphGroups={graphGroups}
+          graphTags={graphTags}
+          graphTopology={graphTopology}
+          ftsQuery={ftsQuery}
+          setFtsQuery={setFtsQuery}
+          ftsResults={ftsResults}
+          semanticQuery={semanticQuery}
+          setSemanticQuery={setSemanticQuery}
+          semanticResults={semanticResults}
+          busy={busy}
+          handleFulltextSearch={handleFulltextSearch}
+          handleSemanticSearch={handleSemanticSearch}
+          focusNode={focusNode}
+          setSelectedVectorResult={setSelectedVectorResult}
+          setViewMode={setViewMode}
+        />
+      ) : (
       <main className="layout-grid">
         <section className="panel">
           <h2>Graphs</h2>
@@ -564,6 +624,7 @@ function App() {
           </label>
         </section>
       </main>
+      )}
     </div>
   );
 }
