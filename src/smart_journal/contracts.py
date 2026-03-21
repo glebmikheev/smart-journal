@@ -178,6 +178,9 @@ class MetaStore(ProviderInfo, Protocol):
         edge_type: str,
         status: str = "pending",
         weight: float | None = None,
+        subtype: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> str: ...
 
     def get_edge(
@@ -201,7 +204,10 @@ class MetaStore(ProviderInfo, Protocol):
         *,
         status: str | None = None,
         weight: float | None = None,
+        provenance: Mapping[str, Any] | None = None,
     ) -> None: ...
+
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None: ...
 
     def mark_node_edges_stale(self, node_id: str) -> int: ...
 

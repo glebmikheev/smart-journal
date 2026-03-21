@@ -15,6 +15,12 @@ backend = "in_process"
 
 [extractor]
 backend = "basic_v1"
+enable_image_ocr = true
+ocr_backend = "ppocr_v5"
+ocr_profile = "mobile_optional"
+ocr_device = "cpu"
+# ocr_languages = ["en", "ru"]
+# ocr_strict_language = false
 
 [embedding_provider]
 backend = "multilingual_e5_small"
