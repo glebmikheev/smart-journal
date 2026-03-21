@@ -1,6 +1,6 @@
 # Smart Journal
 
-Increment 5 baseline for the Smart Journal knowledge base.
+Increment 8 baseline for the Smart Journal knowledge base (with API hardening).
 
 ## What is implemented
 
@@ -37,10 +37,15 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - FTS prefix search (`te` matches `test`)
 - vector query payload enriched with chunk/node/content context
 - graph/node detail API + group/tag APIs (without edge CRUD yet)
+- graph/node detail and topology APIs now include edge payloads and aggregated edge counters
+- node-details API now includes relationship direction (`incoming`/`outgoing`/`self`)
+- Explore mode API (`/api/explore/run`) with implication provenance and optional synthesis node
+- edge status APIs (`/api/edges/{edge_id}/accept|reject|patch`)
 - startup auto-rebuild of non-durable vector index backends (e.g. `in_memory`) from embeddings
 - FTS5 full-text search index in SQLite meta store
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
+- optional local real LLM provider backend: `ollama_chat` (kept optional; default remains `mock_chat`)
 - config-driven provider selection through factories
 - mock/in-memory providers kept for testing and fallback
 - CLI that can list providers and start an app shell
@@ -125,4 +130,14 @@ batch_size = 32
 
 [llm_provider]
 backend = "mock_chat"
+```
+
+Optional local Ollama backend:
+
+```toml
+[llm_provider]
+backend = "ollama_chat"
+base_url = "http://127.0.0.1:11434"
+model = "llama3.1:8b-instruct"
+timeout_seconds = 60
 ```
