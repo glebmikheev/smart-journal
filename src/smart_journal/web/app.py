@@ -701,6 +701,8 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         return {
             "query": result.query,
             "graph_id": result.graph_id,
+            "explore_session_id": result.explore_session_id,
+            "prompt_hash": result.prompt_hash,
             "retrieval": [
                 {
                     "chunk_id": row.chunk_id,
@@ -720,6 +722,7 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                     "weight": float(row.weight),
                     "statement": row.statement,
                     "evidence_chunk_ids": list(row.evidence_chunk_ids),
+                    "provenance": dict(row.provenance),
                 }
                 for row in result.inferences
             ],

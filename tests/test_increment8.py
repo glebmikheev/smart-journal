@@ -95,6 +95,8 @@ class IncrementEightAcceptanceTests(unittest.TestCase):
                 self.assertLessEqual(len(result.inferences), 5)
                 self.assertIsNotNone(result.synthesis_node_id)
                 assert result.synthesis_node_id is not None
+                self.assertTrue(bool(result.explore_session_id))
+                self.assertEqual(len(result.prompt_hash), 64)
 
                 synthesis_node = meta_store.get_node(result.synthesis_node_id)
                 self.assertIsNotNone(synthesis_node)
@@ -109,6 +111,16 @@ class IncrementEightAcceptanceTests(unittest.TestCase):
                     assert edge is not None
                     self.assertEqual(str(edge["edge_type"]), "implication")
                     self.assertEqual(str(edge["status"]), "pending")
+                    self.assertEqual(str(edge["subtype"]), result.explore_session_id)
+                    self.assertEqual(str(edge["created_by"]), "llm")
+                    provenance = edge.get("provenance")
+                    self.assertIsInstance(provenance, dict)
+                    assert isinstance(provenance, dict)
+                    self.assertEqual(str(provenance.get("query")), result.query)
+                    self.assertEqual(
+                        str(provenance.get("explore_session_id")),
+                        result.explore_session_id,
+                    )
                     for chunk_id in inference.evidence_chunk_ids:
                         self.assertIsNotNone(meta_store.get_chunk(chunk_id))
 
