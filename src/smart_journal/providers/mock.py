@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import io
 import json
 import math
+import os
 import re
+import tempfile
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -1110,12 +1114,19 @@ class PlainTextExtractor:
 
 
 class BasicExtractorV1:
-    def __init__(self, _: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, options: Mapping[str, Any] | None = None) -> None:
+        options = options or {}
         self._text_mimes = {"text/plain", "text/markdown"}
         self._pdf_mimes = {"application/pdf"}
         self._image_mimes = {"image/png", "image/jpeg", "image/webp"}
         self._audio_mimes = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg"}
         self._video_mimes = {"video/mp4", "video/webm", "video/quicktime"}
+        self._enable_image_ocr = _read_bool_option(options, "enable_image_ocr", default=True)
+        self._enable_audio_asr = _read_bool_option(options, "enable_audio_asr", default=True)
+        self._ocr_lang = str(options.get("ocr_lang", "eng")).strip() or "eng"
+        self._asr_model = str(options.get("asr_model", "base")).strip() or "base"
+        self._asr_language = str(options.get("asr_language", "")).strip() or None
+        self._asr_device = str(options.get("asr_device", "")).strip() or None
         self._supported_mime_types = (
             self._text_mimes
             | self._pdf_mimes
@@ -1136,6 +1147,8 @@ class BasicExtractorV1:
                 self._supported_mime_types
             ),
             "outputs": ["text", "thumbnail", "metadata"],
+            "ocr_enabled": self._enable_image_ocr,
+            "audio_asr_enabled": self._enable_audio_asr,
         }
 
     def supports_mime(self, mime_type: str) -> bool:
@@ -1158,27 +1171,184 @@ class BasicExtractorV1:
             )
         if mime_type in self._image_mimes:
             digest = hashlib.sha256(content).hexdigest()
+            extracted_text = ""
+            metadata: dict[str, str] = {
+                "source_mime_type": mime_type,
+                "thumbnail_checksum": digest,
+                "source_size_bytes": str(len(content)),
+            }
+            if self._enable_image_ocr:
+                ocr_text, ocr_metadata = _run_image_ocr(content, lang=self._ocr_lang)
+                extracted_text = ocr_text
+                metadata.update(ocr_metadata)
+            else:
+                metadata["ocr_status"] = "disabled"
             return ExtractedArtifact(
                 content_type="image/thumbnail",
-                text=None,
-                metadata={
-                    "source_mime_type": mime_type,
-                    "thumbnail_checksum": digest,
-                    "source_size_bytes": str(len(content)),
-                },
+                text=(extracted_text or None),
+                metadata=metadata,
             )
-        if mime_type in self._audio_mimes or mime_type in self._video_mimes:
-            media_type = "audio" if mime_type in self._audio_mimes else "video"
+        if mime_type in self._audio_mimes:
+            transcript = ""
+            metadata = {
+                "source_mime_type": mime_type,
+                "media_type": "audio",
+                "source_size_bytes": str(len(content)),
+            }
+            if self._enable_audio_asr:
+                asr_text, asr_metadata = _run_audio_asr(
+                    content,
+                    mime_type=mime_type,
+                    model=self._asr_model,
+                    language=self._asr_language,
+                    device=self._asr_device,
+                )
+                transcript = asr_text
+                metadata.update(asr_metadata)
+            else:
+                metadata["asr_status"] = "disabled"
             return ExtractedArtifact(
-                content_type=f"{media_type}/metadata",
+                content_type="audio/metadata",
+                text=(transcript or None),
+                metadata=metadata,
+            )
+        if mime_type in self._video_mimes:
+            return ExtractedArtifact(
+                content_type="video/metadata",
                 text=None,
                 metadata={
                     "source_mime_type": mime_type,
-                    "media_type": media_type,
+                    "media_type": "video",
                     "source_size_bytes": str(len(content)),
                 },
             )
         raise ValueError(f"Unsupported MIME type: {mime_type}")
+
+
+def _read_bool_option(
+    options: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    raw_value = options.get(key, default)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int):
+        return bool(raw_value)
+    if raw_value is None:
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _run_image_ocr(content: bytes, *, lang: str) -> tuple[str, dict[str, str]]:
+    lang_id = lang.strip() or "eng"
+    metadata = {
+        "ocr_status": "attempted",
+        "ocr_lang": lang_id,
+        "ocr_engine": "pytesseract",
+    }
+    try:
+        image_module = importlib.import_module("PIL.Image")
+        pytesseract_module = importlib.import_module("pytesseract")
+    except Exception as error:  # noqa: BLE001
+        metadata["ocr_status"] = "unavailable"
+        metadata["ocr_error"] = _format_error(error)
+        return "", metadata
+
+    try:
+        with image_module.open(io.BytesIO(content)) as image:
+            text = str(pytesseract_module.image_to_string(image, lang=lang_id)).strip()
+        metadata["ocr_status"] = "ok"
+        metadata["ocr_text_length"] = str(len(text))
+        return text, metadata
+    except Exception as error:  # noqa: BLE001
+        metadata["ocr_status"] = "error"
+        metadata["ocr_error"] = _format_error(error)
+        return "", metadata
+
+
+def _run_audio_asr(
+    content: bytes,
+    *,
+    mime_type: str,
+    model: str,
+    language: str | None = None,
+    device: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    model_id = model.strip() or "base"
+    metadata = {
+        "asr_status": "attempted",
+        "asr_backend": "whisper",
+        "asr_model": model_id,
+    }
+    if language:
+        metadata["asr_language"] = language
+    if device:
+        metadata["asr_device"] = device
+    try:
+        whisper_module = importlib.import_module("whisper")
+    except Exception as error:  # noqa: BLE001
+        metadata["asr_status"] = "unavailable"
+        metadata["asr_error"] = _format_error(error)
+        return "", metadata
+
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=_audio_suffix_for_mime(mime_type),
+            delete=False,
+        ) as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        load_kwargs: dict[str, str] = {}
+        if device:
+            load_kwargs["device"] = device
+        whisper_model = whisper_module.load_model(model_id, **load_kwargs)
+
+        transcribe_kwargs: dict[str, str] = {}
+        if language:
+            transcribe_kwargs["language"] = language
+        raw_result = whisper_model.transcribe(temp_path, **transcribe_kwargs)
+        result_text = ""
+        if isinstance(raw_result, Mapping):
+            result_text = str(raw_result.get("text", "")).strip()
+        else:
+            result_text = str(raw_result).strip()
+        metadata["asr_status"] = "ok"
+        metadata["asr_text_length"] = str(len(result_text))
+        return result_text, metadata
+    except Exception as error:  # noqa: BLE001
+        metadata["asr_status"] = "error"
+        metadata["asr_error"] = _format_error(error)
+        return "", metadata
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _audio_suffix_for_mime(mime_type: str) -> str:
+    mime_to_suffix = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/ogg": ".ogg",
+    }
+    return mime_to_suffix.get(mime_type, ".audio")
+
+
+def _format_error(error: Exception, *, max_length: int = 240) -> str:
+    message = f"{error.__class__.__name__}: {error}"
+    if len(message) <= max_length:
+        return message
+    return message[: max_length - 3] + "..."
 
 
 class MockEmbeddingProvider:
