@@ -203,7 +203,16 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
         self.assertIsNotNone(image_artifact.metadata)
         assert image_artifact.metadata is not None
         self.assertEqual(image_artifact.metadata.get("ocr_status"), "ok")
-        run_ocr.assert_called_once_with(image_payload, lang="deu")
+        run_ocr.assert_called_once()
+        ocr_call_args = run_ocr.call_args
+        self.assertIsNotNone(ocr_call_args)
+        assert ocr_call_args is not None
+        self.assertEqual(ocr_call_args.args[0], image_payload)
+        self.assertEqual(ocr_call_args.kwargs["backend"], "ppocr_v5")
+        self.assertEqual(ocr_call_args.kwargs["lang"], "deu")
+        self.assertEqual(ocr_call_args.kwargs["languages"], ["deu"])
+        self.assertEqual(ocr_call_args.kwargs["device"], "cpu")
+        self.assertEqual(ocr_call_args.kwargs["profile_name"], "mobile_optional")
 
         self.assertEqual(audio_artifact.content_type, "audio/metadata")
         self.assertEqual(audio_artifact.text, "detected transcript")
@@ -283,6 +292,30 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
         extractor = BasicExtractorV1({"asr_language": "fr"})
         capabilities = extractor.capabilities()
         self.assertEqual(capabilities.get("audio_asr_configured_languages"), ["fr"])
+
+    def test_basic_extractor_defaults_to_mobile_optional_ocr_profile(self) -> None:
+        extractor = BasicExtractorV1()
+        capabilities = extractor.capabilities()
+
+        self.assertEqual(capabilities.get("ocr_backend"), "ppocr_v5")
+        self.assertEqual(capabilities.get("ocr_active_profile"), "mobile_optional")
+        profile_names = capabilities.get("ocr_profiles")
+        self.assertIsInstance(profile_names, list)
+        assert isinstance(profile_names, list)
+        self.assertIn("mobile_optional", profile_names)
+        self.assertIn("server_optional", profile_names)
+
+    def test_basic_extractor_can_switch_active_ocr_profile(self) -> None:
+        extractor = BasicExtractorV1()
+        switched = extractor.set_active_ocr_profile("server")
+        self.assertEqual(str(switched.get("profile_name")), "server")
+        capabilities = extractor.capabilities()
+        self.assertEqual(capabilities.get("ocr_active_profile"), "server")
+
+    def test_basic_extractor_rejects_unknown_ocr_profile(self) -> None:
+        extractor = BasicExtractorV1()
+        with self.assertRaises(ValueError):
+            extractor.set_active_ocr_profile("no_such_profile")
 
 
 if __name__ == "__main__":

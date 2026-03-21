@@ -136,6 +136,10 @@ class ExploreRunRequest(BaseModel):
     replay_vector_ops: bool = True
 
 
+class SetOCRProfileRequest(BaseModel):
+    profile: str = Field(min_length=1, max_length=80)
+
+
 def create_app(config_path: Path | None = None) -> FastAPI:
     resolved_config_path = _resolve_config_path(config_path)
 
@@ -217,6 +221,45 @@ def create_app(config_path: Path | None = None) -> FastAPI:
     def list_selected_providers(request: Request) -> dict[str, dict[str, Any]]:
         runtime = _runtime_from_request(request)
         return _selected_providers_payload(runtime.bundle)
+
+    @api.get("/ocr/profiles")
+    def list_ocr_profiles(request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        extractor = runtime.bundle.extractor
+        list_profiles = getattr(extractor, "list_ocr_profiles", None)
+        get_active = getattr(extractor, "get_active_ocr_profile", None)
+        if not callable(list_profiles) or not callable(get_active):
+            return {"supported": False, "profiles": [], "active_profile": {}}
+        try:
+            profiles = [_mapping_to_dict(row) for row in list_profiles()]
+            active_profile = _mapping_to_dict(get_active())
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "supported": True,
+            "profiles": profiles,
+            "active_profile": active_profile,
+        }
+
+    @api.post("/ocr/active")
+    def set_ocr_profile(payload: SetOCRProfileRequest, request: Request) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        extractor = runtime.bundle.extractor
+        set_active = getattr(extractor, "set_active_ocr_profile", None)
+        if not callable(set_active):
+            raise HTTPException(
+                status_code=501,
+                detail="Active extractor does not support OCR profile switching.",
+            )
+        try:
+            active_profile = _mapping_to_dict(set_active(payload.profile))
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "supported": True,
+            "active_profile": active_profile,
+            "extractor": _provider_payload(runtime.bundle.extractor),
+        }
 
     @api.get("/graphs")
     def list_graphs(
