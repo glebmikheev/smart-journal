@@ -10,6 +10,7 @@ from .mock import (
     MockLLMProvider,
     PlainTextExtractor,
 )
+from .ollama import OllamaLLMProvider
 from .sqlite_meta import SQLiteMetaStore
 from .usearch_file import USearchFileVectorIndex
 
@@ -23,6 +24,7 @@ __all__ = [
     "InProcessJobQueue",
     "MockEmbeddingProvider",
     "MockLLMProvider",
+    "OllamaLLMProvider",
     "PlainTextExtractor",
     "SQLiteMetaStore",
     "USearchFileVectorIndex",
