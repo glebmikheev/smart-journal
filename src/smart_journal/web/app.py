@@ -100,6 +100,12 @@ class SemanticSuggestRequest(BaseModel):
     replay_vector_ops: bool = True
 
 
+class SemanticRecomputeRequest(BaseModel):
+    top_k_per_chunk: int = Field(default=10, ge=1, le=200)
+    max_suggestions: int = Field(default=10, ge=1, le=200)
+    replay_vector_ops: bool = True
+
+
 class EdgeStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=32)
 
@@ -606,6 +612,53 @@ def create_app(config_path: Path | None = None) -> FastAPI:
                 }
                 for suggestion in suggestions
             ],
+            "vector_replay": replay_stats,
+        }
+
+    @api.post("/nodes/{node_id}/semantic/recompute")
+    def recompute_semantic_links(
+        node_id: str,
+        payload: SemanticRecomputeRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        node = runtime.bundle.meta_store.get_node(node_id)
+        if node is None:
+            raise HTTPException(status_code=404, detail=f"Node not found: {node_id}")
+        replay_stats: dict[str, Any] | None = None
+        try:
+            if payload.replay_vector_ops:
+                replay_stats = _replay_stats_payload(
+                    _replay_vector_index(bundle=runtime.bundle, limit=10_000)
+                )
+            linker = SemanticLinker(
+                meta_store=runtime.bundle.meta_store,
+                vector_index=runtime.bundle.vector_index,
+                model_id=runtime.bundle.embedding_provider.model_id(),
+            )
+            result = linker.recompute_for_node(
+                node_id=node_id,
+                top_k_per_chunk=payload.top_k_per_chunk,
+                max_suggestions=payload.max_suggestions,
+            )
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "node_id": node_id,
+            "graph_id": str(node["graph_id"]),
+            "suggestions": [
+                {
+                    "edge_id": suggestion.edge_id,
+                    "from_node_id": suggestion.from_node_id,
+                    "to_node_id": suggestion.to_node_id,
+                    "status": suggestion.status,
+                    "weight": float(suggestion.weight),
+                    "supporting_chunk_hits": int(suggestion.supporting_chunk_hits),
+                }
+                for suggestion in result.suggestions
+            ],
+            "stale_edge_ids": list(result.stale_edge_ids),
+            "stale_edge_count": int(result.stale_edge_count),
             "vector_replay": replay_stats,
         }
 
