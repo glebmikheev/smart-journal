@@ -30,6 +30,9 @@ Increment 5 baseline for the Smart Journal knowledge base.
 - replay of pending `vector_index_ops` at startup (`smart-journal run`)
 - FastAPI web backend (`smart-journal serve`) for graphs/nodes/search/ingestion/vector query
 - React web UI scaffold in `ui/` (Vite) connected to FastAPI API
+- dual-mode web UI:
+  - existing control/table panel for CRUD/search/ingestion workflows
+  - new interactive 2D graph canvas (nodes/groups/tags + retrieval overlays)
 - embedder warmup at API startup (default enabled) to avoid first-query latency
 - FTS prefix search (`te` matches `test`)
 - vector query payload enriched with chunk/node/content context
