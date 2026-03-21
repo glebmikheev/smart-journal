@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import tempfile
 from pathlib import Path
 from typing import Any
@@ -24,11 +25,6 @@ def build_parser() -> argparse.ArgumentParser:
             "Path to image file. Can be passed multiple times. "
             "If omitted, the script tries to generate a synthetic sample via Pillow."
         ),
-    )
-    parser.add_argument(
-        "--ocr-backend",
-        default="ppocr_v5",
-        help="OCR backend (default: ppocr_v5).",
     )
     parser.add_argument(
         "--ocr-profile",
@@ -61,6 +57,7 @@ def build_parser() -> argparse.ArgumentParser:
 def main() -> int:
     parser = build_parser()
     args = parser.parse_args()
+    runtime_env = _ensure_ppocr_runtime_env()
     image_paths = [Path(raw).expanduser().resolve() for raw in args.image]
 
     if not image_paths:
@@ -103,7 +100,7 @@ def main() -> int:
         {
             "enable_image_ocr": True,
             "enable_audio_asr": False,
-            "ocr_backend": str(args.ocr_backend),
+            "ocr_backend": "ppocr_v5",
             "ocr_profile": str(args.ocr_profile),
             "ocr_device": str(args.ocr_device),
             "ocr_languages": ocr_languages,
@@ -130,6 +127,7 @@ def main() -> int:
         }
         output = {
             "ok": ok_count > 0,
+            "runtime_env": runtime_env,
             "extractor": {
                 "provider_id": extractor.provider_id(),
                 "version": extractor.version(),
@@ -181,6 +179,27 @@ def _guess_mime_type(path: Path) -> str:
 def _parse_languages(raw: str) -> list[str]:
     normalized = [part.strip() for part in raw.split(",")]
     return [part for part in normalized if part]
+
+
+def _ensure_ppocr_runtime_env() -> dict[str, str]:
+    runtime_root = Path.cwd() / ".runtime"
+    runtime_root.mkdir(parents=True, exist_ok=True)
+    applied: dict[str, str] = {}
+
+    candidates = {
+        "PADDLE_HOME": runtime_root / "paddle",
+        "PADDLE_PDX_CACHE_HOME": runtime_root / "paddlex",
+        "HF_HOME": runtime_root / "hf",
+        "MODELSCOPE_CACHE": runtime_root / "modelscope",
+    }
+    for key, path in candidates.items():
+        if os.getenv(key):
+            continue
+        path.mkdir(parents=True, exist_ok=True)
+        value = str(path.resolve())
+        os.environ[key] = value
+        applied[key] = value
+    return applied
 
 
 def _create_synthetic_image(text: str) -> tuple[Path | None, str | None]:

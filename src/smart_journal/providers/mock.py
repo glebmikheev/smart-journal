@@ -3,7 +3,6 @@ from __future__ import annotations
 import hashlib
 import importlib
 import inspect
-import io
 import json
 import math
 import os
@@ -1125,9 +1124,7 @@ class BasicExtractorV1:
         self._enable_image_ocr = _read_bool_option(options, "enable_image_ocr", default=True)
         self._enable_audio_asr = _read_bool_option(options, "enable_audio_asr", default=True)
         self._ocr_lang = str(options.get("ocr_lang", "eng")).strip() or "eng"
-        self._ocr_backend = (
-            str(options.get("ocr_backend", "ppocr_v5")).strip().lower() or "ppocr_v5"
-        )
+        self._ocr_backend = _normalize_ocr_backend_option(options)
         self._ocr_device = str(options.get("ocr_device", "cpu")).strip() or "cpu"
         self._ocr_strict_language = _read_bool_option(
             options,
@@ -1375,6 +1372,15 @@ def _read_ocr_languages_option(
     return []
 
 
+def _normalize_ocr_backend_option(options: Mapping[str, Any]) -> str:
+    raw_backend = str(options.get("ocr_backend", "ppocr_v5")).strip().lower()
+    if not raw_backend or raw_backend in {"ppocr_v5", "ppocr"}:
+        return "ppocr_v5"
+    raise ValueError(
+        f"Unsupported OCR backend '{raw_backend}'. Only 'ppocr_v5' is supported."
+    )
+
+
 def _read_ocr_profiles_option(options: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
     profiles: dict[str, dict[str, Any]] = {
         name: dict(profile)
@@ -1599,26 +1605,27 @@ def _run_image_ocr(
     runtime_cache: dict[tuple[str, str, str], Any],
 ) -> tuple[str, dict[str, str]]:
     normalized_backend = backend.strip().lower() or "ppocr_v5"
-    if normalized_backend in {"ppocr_v5", "ppocr"}:
-        return _run_image_ocr_ppocr(
-            content,
-            lang=lang,
-            languages=languages,
-            device=device,
-            strict_language=strict_language,
-            profile_name=profile_name,
-            profiles=profiles,
-            runtime_cache=runtime_cache,
+    if normalized_backend not in {"ppocr_v5", "ppocr"}:
+        return (
+            "",
+            {
+                "ocr_status": "error",
+                "ocr_backend": normalized_backend,
+                "ocr_error": (
+                    f"Unsupported OCR backend: {normalized_backend}. "
+                    "Only ppocr_v5 is supported."
+                ),
+            },
         )
-    if normalized_backend in {"pytesseract", "tesseract"}:
-        return _run_image_ocr_tesseract(content, lang=lang)
-    return (
-        "",
-        {
-            "ocr_status": "error",
-            "ocr_backend": normalized_backend,
-            "ocr_error": f"Unsupported ocr backend: {normalized_backend}",
-        },
+    return _run_image_ocr_ppocr(
+        content,
+        lang=lang,
+        languages=languages,
+        device=device,
+        strict_language=strict_language,
+        profile_name=profile_name,
+        profiles=profiles,
+        runtime_cache=runtime_cache,
     )
 
 
@@ -1876,34 +1883,6 @@ def _extract_ppocr_text_and_score(raw_result: Any) -> tuple[str, float]:
     if scores:
         return combined, sum(scores) / float(len(scores))
     return combined, min(1.0, float(len(combined)) / 600.0)
-
-
-def _run_image_ocr_tesseract(content: bytes, *, lang: str) -> tuple[str, dict[str, str]]:
-    lang_id = lang.strip() or "eng"
-    metadata = {
-        "ocr_status": "attempted",
-        "ocr_lang": lang_id,
-        "ocr_backend": "pytesseract",
-        "ocr_engine": "pytesseract",
-    }
-    try:
-        image_module = importlib.import_module("PIL.Image")
-        pytesseract_module = importlib.import_module("pytesseract")
-    except Exception as error:  # noqa: BLE001
-        metadata["ocr_status"] = "unavailable"
-        metadata["ocr_error"] = _format_error(error)
-        return "", metadata
-
-    try:
-        with image_module.open(io.BytesIO(content)) as image:
-            text = str(pytesseract_module.image_to_string(image, lang=lang_id)).strip()
-        metadata["ocr_status"] = "ok"
-        metadata["ocr_text_length"] = str(len(text))
-        return text, metadata
-    except Exception as error:  # noqa: BLE001
-        metadata["ocr_status"] = "error"
-        metadata["ocr_error"] = _format_error(error)
-        return "", metadata
 
 
 def _run_audio_asr(

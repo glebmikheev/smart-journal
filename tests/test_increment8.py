@@ -317,6 +317,10 @@ class IncrementEightMultimodalExtractorTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             extractor.set_active_ocr_profile("no_such_profile")
 
+    def test_basic_extractor_rejects_non_ppocr_backend(self) -> None:
+        with self.assertRaises(ValueError):
+            BasicExtractorV1({"ocr_backend": "pytesseract"})
+
 
 if __name__ == "__main__":
     unittest.main()
