@@ -46,6 +46,7 @@ Increment 8 baseline for the Smart Journal knowledge base (with API hardening).
 - Search API with scope filters: graph, group, tags
 - CRUD for tags/groups and node-to-tag/node-to-group relations
 - optional local real LLM provider backend: `ollama_chat` (kept optional; default remains `mock_chat`)
+- optional cloud LLM provider backend: `openai_chat` (OpenAI SDK)
 - config-driven provider selection through factories
 - mock/in-memory providers kept for testing and fallback
 - CLI that can list providers and start an app shell
@@ -139,5 +140,15 @@ Optional local Ollama backend:
 backend = "ollama_chat"
 base_url = "http://127.0.0.1:11434"
 model = "llama3.1:8b-instruct"
+timeout_seconds = 60
+```
+
+Optional OpenAI backend:
+
+```toml
+[llm_provider]
+backend = "openai_chat"
+model = "gpt-4.1-mini"
+api_key = "sk-..."  # or use OPENAI_API_KEY env var
 timeout_seconds = 60
 ```

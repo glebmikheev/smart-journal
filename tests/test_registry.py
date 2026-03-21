@@ -41,6 +41,7 @@ class RegistryTests(unittest.TestCase):
         self.assertIn("basic_v1", extractor_ids)
         self.assertIn("mock_chat", llm_ids)
         self.assertIn("ollama_chat", llm_ids)
+        self.assertIn("openai_chat", llm_ids)
 
 
 if __name__ == "__main__":
