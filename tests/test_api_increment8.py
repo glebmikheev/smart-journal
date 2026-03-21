@@ -10,6 +10,73 @@ from smart_journal.web.app import create_app
 
 
 class IncrementEightApiIntegrationTests(unittest.TestCase):
+    def test_manual_association_edge_crud_endpoints(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._client(Path(tmp_dir)) as client:
+                graph_id = self._create_graph(client, "Association CRUD graph")
+                node_a = self._create_node(client, graph_id=graph_id, title="A", body="a")
+                node_b = self._create_node(client, graph_id=graph_id, title="B", body="b")
+
+                create_response = client.post(
+                    f"/api/graphs/{graph_id}/edges/association",
+                    json={
+                        "from_node_id": node_a,
+                        "to_node_id": node_b,
+                        "status": "accepted",
+                        "weight": 0.81,
+                        "note": "manual association",
+                    },
+                )
+                self.assertEqual(create_response.status_code, 201)
+                created_edge = create_response.json()
+                edge_id = str(created_edge["edge_id"])
+                self.assertEqual(str(created_edge["edge_type"]), "association")
+                self.assertEqual(str(created_edge["status"]), "accepted")
+                self.assertEqual(str(created_edge["created_by"]), "user")
+                self.assertAlmostEqual(float(created_edge["weight"]), 0.81, places=6)
+                self.assertEqual(
+                    str(created_edge["provenance"].get("note")),
+                    "manual association",
+                )
+
+                get_response = client.get(f"/api/edges/{edge_id}")
+                self.assertEqual(get_response.status_code, 200)
+                fetched_edge = get_response.json()
+                self.assertEqual(str(fetched_edge["edge_id"]), edge_id)
+
+                patch_response = client.patch(
+                    f"/api/edges/{edge_id}/association",
+                    json={
+                        "status": "pending",
+                        "weight": 0.42,
+                        "note": "updated note",
+                    },
+                )
+                self.assertEqual(patch_response.status_code, 200)
+                patched_edge = patch_response.json()
+                self.assertEqual(str(patched_edge["status"]), "pending")
+                self.assertAlmostEqual(float(patched_edge["weight"]), 0.42, places=6)
+                self.assertEqual(str(patched_edge["provenance"].get("note")), "updated note")
+
+                delete_response = client.delete(f"/api/edges/{edge_id}/association")
+                self.assertEqual(delete_response.status_code, 200)
+                deleted_payload = delete_response.json()
+                self.assertEqual(str(deleted_payload["edge_id"]), edge_id)
+                self.assertTrue(bool(deleted_payload["deleted"]))
+                self.assertIsNotNone(deleted_payload["edge"])
+                self.assertTrue(bool(deleted_payload["edge"].get("deleted_at")))
+
+                get_deleted_response = client.get(f"/api/edges/{edge_id}")
+                self.assertEqual(get_deleted_response.status_code, 404)
+
+                get_deleted_including_response = client.get(
+                    f"/api/edges/{edge_id}",
+                    params={"include_deleted": "true"},
+                )
+                self.assertEqual(get_deleted_including_response.status_code, 200)
+                deleted_edge = get_deleted_including_response.json()
+                self.assertTrue(bool(deleted_edge.get("deleted_at")))
+
     def test_explore_and_edge_status_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self._client(Path(tmp_dir)) as client:

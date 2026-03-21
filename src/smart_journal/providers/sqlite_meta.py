@@ -834,6 +834,25 @@ class SQLiteMetaStore:
                 (next_status, next_weight, next_provenance, _utc_now(), edge_id),
             )
 
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None:
+        if soft_delete:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    UPDATE edges
+                    SET deleted_at = ?,
+                        updated_at = ?
+                    WHERE edge_id = ? AND deleted_at IS NULL
+                    """,
+                    (_utc_now(), _utc_now(), edge_id),
+                )
+            return
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM edges WHERE edge_id = ?",
+                (edge_id,),
+            )
+
     def mark_node_edges_stale(self, node_id: str) -> int:
         node = self.get_node(node_id)
         if node is None:

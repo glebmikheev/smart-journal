@@ -684,6 +684,19 @@ class InMemoryMetaStore:
             edge["provenance"] = _normalize_provenance(provenance)
         edge["updated_at"] = _utc_now()
 
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None:
+        edge = self._edges.get(edge_id)
+        if edge is None:
+            return
+        if soft_delete:
+            if edge["deleted_at"] is not None:
+                return
+            timestamp = _utc_now()
+            edge["deleted_at"] = timestamp
+            edge["updated_at"] = timestamp
+            return
+        self._edges.pop(edge_id, None)
+
     def mark_node_edges_stale(self, node_id: str) -> int:
         node = self.get_node(node_id)
         if node is None:

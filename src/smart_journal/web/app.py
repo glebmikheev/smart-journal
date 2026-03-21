@@ -111,6 +111,21 @@ class EdgeStatusRequest(BaseModel):
     status: str = Field(min_length=1, max_length=32)
 
 
+class CreateAssociationEdgeRequest(BaseModel):
+    from_node_id: str = Field(min_length=1)
+    to_node_id: str = Field(min_length=1)
+    status: str = Field(default="accepted", min_length=1, max_length=32)
+    weight: float = Field(default=1.0, ge=0.0, le=1.0)
+    note: str | None = Field(default=None, max_length=2_000)
+
+
+class UpdateAssociationEdgeRequest(BaseModel):
+    status: str | None = Field(default=None, min_length=1, max_length=32)
+    weight: float | None = Field(default=None, ge=0.0, le=1.0)
+    note: str | None = Field(default=None, max_length=2_000)
+    clear_note: bool = False
+
+
 class ExploreRunRequest(BaseModel):
     query: str = Field(min_length=1)
     graph_id: str = Field(min_length=1)
@@ -410,6 +425,40 @@ def create_app(config_path: Path | None = None) -> FastAPI:
         except Exception as error:  # noqa: BLE001
             _raise_http_error(error)
         return [_to_dict(edge) for edge in edges]
+
+    @api.post("/graphs/{graph_id}/edges/association", status_code=201)
+    def create_association_edge(
+        graph_id: str,
+        payload: CreateAssociationEdgeRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        from_node_id = payload.from_node_id.strip()
+        to_node_id = payload.to_node_id.strip()
+        if not from_node_id or not to_node_id:
+            raise HTTPException(
+                status_code=400,
+                detail="from_node_id/to_node_id must not be empty.",
+            )
+        note = payload.note.strip() if payload.note is not None else ""
+        provenance = {"note": note} if note else None
+        try:
+            edge_id = runtime.bundle.meta_store.create_edge(
+                graph_id=graph_id,
+                from_node_id=from_node_id,
+                to_node_id=to_node_id,
+                edge_type="association",
+                status=payload.status.strip().lower(),
+                weight=float(payload.weight),
+                provenance=provenance,
+                created_by="user",
+            )
+            edge = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if edge is None:
+            raise HTTPException(status_code=500, detail="Association edge creation failed.")
+        return _edge_payload(edge)
 
     @api.get("/graphs/{graph_id}/nodes")
     def list_graph_nodes(
@@ -1059,6 +1108,93 @@ def create_app(config_path: Path | None = None) -> FastAPI:
             raise HTTPException(status_code=404, detail=f"Job not found: {job_id}")
         return _to_dict(job)
 
+    @api.get("/edges/{edge_id}")
+    def get_edge(
+        edge_id: str,
+        request: Request,
+        include_deleted: bool = QUERY_INCLUDE_DELETED,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        edge = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=include_deleted)
+        if edge is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        return _edge_payload(edge)
+
+    @api.patch("/edges/{edge_id}/association")
+    def patch_association_edge(
+        edge_id: str,
+        payload: UpdateAssociationEdgeRequest,
+        request: Request,
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        has_changes = (
+            payload.status is not None
+            or payload.weight is not None
+            or payload.note is not None
+            or payload.clear_note
+        )
+        if not has_changes:
+            raise HTTPException(status_code=400, detail="At least one field must be provided.")
+        edge = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=True)
+        if edge is None or edge.get("deleted_at") is not None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        if str(edge.get("edge_type")) != "association":
+            raise HTTPException(
+                status_code=400,
+                detail="Association patch endpoint supports only association edges.",
+            )
+        next_provenance: dict[str, Any] | None = None
+        if payload.note is not None or payload.clear_note:
+            next_provenance = _mapping_to_dict(edge.get("provenance"))
+            if payload.clear_note:
+                next_provenance.pop("note", None)
+            if payload.note is not None:
+                note = payload.note.strip()
+                if note:
+                    next_provenance["note"] = note
+                else:
+                    next_provenance.pop("note", None)
+        try:
+            runtime.bundle.meta_store.update_edge(
+                edge_id=edge_id,
+                status=(payload.status.strip().lower() if payload.status is not None else None),
+                weight=payload.weight,
+                provenance=next_provenance,
+            )
+            updated = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        if updated is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        return _edge_payload(updated)
+
+    @api.delete("/edges/{edge_id}/association")
+    def delete_association_edge(
+        edge_id: str,
+        request: Request,
+        soft_delete: bool = Query(default=True),
+    ) -> dict[str, Any]:
+        runtime = _runtime_from_request(request)
+        edge = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=True)
+        if edge is None:
+            raise HTTPException(status_code=404, detail=f"Edge not found: {edge_id}")
+        if str(edge.get("edge_type")) != "association":
+            raise HTTPException(
+                status_code=400,
+                detail="Association delete endpoint supports only association edges.",
+            )
+        try:
+            runtime.bundle.meta_store.delete_edge(edge_id=edge_id, soft_delete=soft_delete)
+            deleted_edge = runtime.bundle.meta_store.get_edge(edge_id=edge_id, include_deleted=True)
+        except Exception as error:  # noqa: BLE001
+            _raise_http_error(error)
+        return {
+            "edge_id": edge_id,
+            "deleted": True,
+            "soft_delete": soft_delete,
+            "edge": _edge_payload(deleted_edge) if deleted_edge is not None else None,
+        }
+
     @api.patch("/edges/{edge_id}")
     def patch_edge(
         edge_id: str,
@@ -1225,6 +1361,12 @@ def _to_dict(payload: Mapping[str, Any]) -> dict[str, Any]:
     return {str(key): value for key, value in payload.items()}
 
 
+def _mapping_to_dict(payload: Any) -> dict[str, Any]:
+    if not isinstance(payload, Mapping):
+        return {}
+    return {str(key): value for key, value in payload.items()}
+
+
 def _count_by_key(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]:
     counts: dict[str, int] = {}
     for row in rows:
@@ -1240,11 +1382,7 @@ def _count_by_key(rows: Sequence[Mapping[str, Any]], key: str) -> dict[str, int]
 
 def _edge_payload(edge: Mapping[str, Any]) -> dict[str, Any]:
     payload = _to_dict(edge)
-    provenance = payload.get("provenance")
-    if isinstance(provenance, Mapping):
-        payload["provenance"] = _to_dict(provenance)
-    else:
-        payload["provenance"] = {}
+    payload["provenance"] = _mapping_to_dict(payload.get("provenance"))
     return payload
 
 
