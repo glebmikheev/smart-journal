@@ -159,6 +159,24 @@ python -m pip install paddlepaddle==3.2.0
 python -m pip install paddleocr
 ```
 
+## OCR Smoke Check
+
+Run OCR smoke with auto-generated sample image:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_ocr.py --ocr-profile mobile_optional --ocr-device cpu
+```
+
+Run OCR smoke on real local images:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_ocr.py --image .\samples\ocr1.png --image .\samples\ocr2.jpg --ocr-languages en,ru
+```
+
+Expected: JSON report with `summary.ok >= 1` and `samples[*].ocr_status == "ok"` for at least one image.
+
 Optional local Ollama backend:
 
 ```toml
