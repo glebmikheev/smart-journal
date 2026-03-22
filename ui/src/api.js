@@ -44,6 +44,10 @@ export function getGraphDetails(graphId) {
   return request(`/api/graphs/${encodeURIComponent(graphId)}/details`);
 }
 
+export function getGraphTopology(graphId) {
+  return request(`/api/graphs/${encodeURIComponent(graphId)}/topology`);
+}
+
 export function createNode(graphId, payload) {
   return request(`/api/graphs/${encodeURIComponent(graphId)}/nodes`, {
     method: "POST",

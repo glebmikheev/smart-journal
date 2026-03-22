@@ -1,8 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
+import inspect
+import json
 import math
+import os
 import re
+import tempfile
 from collections import deque
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
@@ -63,10 +68,12 @@ class InMemoryMetaStore:
         self._graphs: dict[str, dict[str, Any]] = {}
         self._nodes: dict[str, dict[str, Any]] = {}
         self._revisions_by_node: dict[str, list[dict[str, Any]]] = {}
+        self._revision_content_manifest: dict[str, list[str]] = {}
         self._content_items: dict[str, dict[str, Any]] = {}
         self._chunks_by_content_item: dict[str, list[dict[str, Any]]] = {}
         self._chunk_embeddings: dict[tuple[str, str], dict[str, Any]] = {}
         self._vector_index_ops: dict[str, dict[str, Any]] = {}
+        self._edges: dict[str, dict[str, Any]] = {}
         self._tags: dict[str, dict[str, Any]] = {}
         self._groups: dict[str, dict[str, Any]] = {}
         self._node_tags: dict[str, set[str]] = {}
@@ -148,6 +155,7 @@ class InMemoryMetaStore:
                 "comment": "create",
             }
         ]
+        self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
         return node_id
 
     def update_node(
@@ -177,6 +185,8 @@ class InMemoryMetaStore:
             }
         )
         node["current_revision_id"] = revision_id
+        self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
+        self.mark_node_edges_stale(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
         node = self._nodes.get(node_id)
@@ -190,9 +200,14 @@ class InMemoryMetaStore:
             return
 
         self._nodes.pop(node_id, None)
-        self._revisions_by_node.pop(node_id, None)
+        removed_revisions = self._revisions_by_node.pop(node_id, [])
+        for revision in removed_revisions:
+            self._revision_content_manifest.pop(str(revision["revision_id"]), None)
         self._node_tags.pop(node_id, None)
         self._node_groups.pop(node_id, None)
+        for edge_id, edge in list(self._edges.items()):
+            if edge["from_node_id"] == node_id or edge["to_node_id"] == node_id:
+                self._edges.pop(edge_id, None)
         for content_item_id, item in list(self._content_items.items()):
             if item["node_id"] == node_id:
                 self._content_items.pop(content_item_id, None)
@@ -224,6 +239,52 @@ class InMemoryMetaStore:
         revisions = self._revisions_by_node.get(node_id, [])
         return [dict(revision) for revision in revisions]
 
+    def get_revision_manifest(
+        self,
+        node_id: str,
+        revision_id: str,
+    ) -> list[Mapping[str, Any]]:
+        _ = self._require_revision(node_id=node_id, revision_id=revision_id)
+        content_item_ids = self._revision_content_manifest.get(revision_id, [])
+        payload: list[Mapping[str, Any]] = []
+        for position, content_item_id in enumerate(content_item_ids):
+            item = self._content_items.get(content_item_id)
+            if item is None:
+                continue
+            payload.append(
+                {
+                    "content_item_id": content_item_id,
+                    "position": position,
+                    "filename": item.get("filename"),
+                    "mime_type": item.get("mime_type"),
+                    "blob_hash": item.get("blob_hash"),
+                    "blob_size": item.get("blob_size"),
+                }
+            )
+        return payload
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]:
+        from_revision = self._require_revision(node_id=node_id, revision_id=from_revision_id)
+        to_revision = self._require_revision(node_id=node_id, revision_id=to_revision_id)
+        source_manifest = self.get_revision_manifest(node_id, from_revision_id)
+        target_manifest = self.get_revision_manifest(node_id, to_revision_id)
+        source_ids = {str(row["content_item_id"]) for row in source_manifest}
+        target_ids = {str(row["content_item_id"]) for row in target_manifest}
+        return {
+            "node_id": node_id,
+            "from_revision_id": from_revision_id,
+            "to_revision_id": to_revision_id,
+            "title_changed": str(from_revision["title"]) != str(to_revision["title"]),
+            "body_changed": str(from_revision["body"]) != str(to_revision["body"]),
+            "added_content_item_ids": sorted(target_ids - source_ids),
+            "removed_content_item_ids": sorted(source_ids - target_ids),
+        }
+
     def attach_content_item(
         self,
         node_id: str,
@@ -252,6 +313,7 @@ class InMemoryMetaStore:
             "deleted_at": None,
         }
         self._chunks_by_content_item.setdefault(content_item_id, [])
+        self.mark_node_edges_stale(node_id)
         return content_item_id
 
     def list_content_items(
@@ -285,10 +347,12 @@ class InMemoryMetaStore:
             for chunk in self._chunks_by_content_item.get(content_item_id, []):
                 if chunk["deleted_at"] is None:
                     chunk["deleted_at"] = deleted_at
+            self.mark_node_edges_stale(str(item["node_id"]))
             return
         self._content_items.pop(content_item_id, None)
         removed_chunks = self._chunks_by_content_item.pop(content_item_id, [])
         self._delete_embeddings_for_chunks([str(chunk["chunk_id"]) for chunk in removed_chunks])
+        self.mark_node_edges_stale(str(item["node_id"]))
 
     def set_content_item_extraction(
         self,
@@ -337,6 +401,7 @@ class InMemoryMetaStore:
             )
         self._delete_embeddings_for_chunks([str(row["chunk_id"]) for row in existing_rows])
         self._chunks_by_content_item[content_item_id] = new_rows
+        self.mark_node_edges_stale(str(item["node_id"]))
         return created_chunk_ids
 
     def list_chunks(
@@ -518,6 +583,179 @@ class InMemoryMetaStore:
                 continue
             row["status"] = "applied"
             row["applied_at"] = timestamp
+
+    def create_edge(
+        self,
+        *,
+        graph_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        status: str = "pending",
+        weight: float | None = None,
+        subtype: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        created_by: str | None = None,
+    ) -> str:
+        if from_node_id == to_node_id:
+            raise ValueError("Self-loop edges are not supported in alpha.")
+        graph = self.get_graph(graph_id)
+        if graph is None:
+            raise KeyError(f"Graph not found or deleted: {graph_id}")
+        from_node = self.get_node(from_node_id)
+        to_node = self.get_node(to_node_id)
+        if from_node is None:
+            raise KeyError(f"Node not found or deleted: {from_node_id}")
+        if to_node is None:
+            raise KeyError(f"Node not found or deleted: {to_node_id}")
+        if str(from_node["graph_id"]) != graph_id or str(to_node["graph_id"]) != graph_id:
+            raise ValueError("Edge endpoints must belong to the same graph.")
+        next_status = _validate_edge_status(status)
+        edge_id = str(uuid4())
+        timestamp = _utc_now()
+        self._edges[edge_id] = {
+            "edge_id": edge_id,
+            "graph_id": graph_id,
+            "from_node_id": from_node_id,
+            "to_node_id": to_node_id,
+            "edge_type": edge_type,
+            "subtype": (subtype.strip() if subtype is not None and subtype.strip() else None),
+            "status": next_status,
+            "weight": (float(weight) if weight is not None else None),
+            "provenance": _normalize_provenance(provenance),
+            "created_by": (
+                created_by.strip() if created_by is not None and created_by.strip() else None
+            ),
+            "created_at": timestamp,
+            "updated_at": timestamp,
+            "deleted_at": None,
+        }
+        return edge_id
+
+    def get_edge(self, edge_id: str, *, include_deleted: bool = False) -> Mapping[str, Any] | None:
+        edge = self._edges.get(edge_id)
+        if edge is None:
+            return None
+        if not include_deleted and edge["deleted_at"] is not None:
+            return None
+        return dict(edge)
+
+    def list_edges(
+        self,
+        *,
+        graph_id: str | None = None,
+        node_id: str | None = None,
+        edge_type: str | None = None,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> list[Mapping[str, Any]]:
+        if limit <= 0:
+            return []
+        rows: list[dict[str, Any]] = []
+        for edge in self._edges.values():
+            if not include_deleted and edge["deleted_at"] is not None:
+                continue
+            if graph_id is not None and str(edge["graph_id"]) != graph_id:
+                continue
+            if node_id is not None:
+                if str(edge["from_node_id"]) != node_id and str(edge["to_node_id"]) != node_id:
+                    continue
+            if edge_type is not None and str(edge["edge_type"]) != edge_type:
+                continue
+            if status is not None and str(edge["status"]) != status:
+                continue
+            rows.append(dict(edge))
+        rows.sort(key=lambda row: (str(row["updated_at"]), str(row["edge_id"])), reverse=True)
+        return [dict(row) for row in rows[:limit]]
+
+    def update_edge(
+        self,
+        edge_id: str,
+        *,
+        status: str | None = None,
+        weight: float | None = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> None:
+        edge = self._edges.get(edge_id)
+        if edge is None or edge["deleted_at"] is not None:
+            raise KeyError(f"Edge not found or deleted: {edge_id}")
+        if status is not None:
+            edge["status"] = _validate_edge_status(status)
+        if weight is not None:
+            edge["weight"] = float(weight)
+        if provenance is not None:
+            edge["provenance"] = _normalize_provenance(provenance)
+        edge["updated_at"] = _utc_now()
+
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None:
+        edge = self._edges.get(edge_id)
+        if edge is None:
+            return
+        if soft_delete:
+            if edge["deleted_at"] is not None:
+                return
+            timestamp = _utc_now()
+            edge["deleted_at"] = timestamp
+            edge["updated_at"] = timestamp
+            return
+        self._edges.pop(edge_id, None)
+
+    def mark_node_edges_stale(self, node_id: str) -> int:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        changed_rows = 0
+        timestamp = _utc_now()
+        for edge in self._edges.values():
+            if edge["deleted_at"] is not None:
+                continue
+            if str(edge["from_node_id"]) != node_id and str(edge["to_node_id"]) != node_id:
+                continue
+            current_status = str(edge["status"])
+            if current_status == "rejected":
+                continue
+            edge_type = str(edge["edge_type"])
+            next_status = "possibly_stale" if edge_type == "association" else "stale"
+            if current_status == next_status:
+                continue
+            edge["status"] = next_status
+            edge["updated_at"] = timestamp
+            changed_rows += 1
+        return changed_rows
+
+    def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str:
+        node = self._nodes.get(node_id)
+        if node is None or node["deleted_at"] is not None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        revisions = self._revisions_by_node.get(node_id, [])
+        source_revision = next(
+            (row for row in revisions if str(row["revision_id"]) == revision_id),
+            None,
+        )
+        if source_revision is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+
+        timestamp = _utc_now()
+        node["title"] = str(source_revision["title"])
+        node["body"] = str(source_revision["body"])
+        node["updated_at"] = timestamp
+
+        next_revision_id = str(uuid4())
+        revision_row = {
+            "revision_id": next_revision_id,
+            "node_id": node_id,
+            "revision_no": len(revisions) + 1,
+            "title": str(source_revision["title"]),
+            "body": str(source_revision["body"]),
+            "created_at": timestamp,
+            "comment": f"rollback:{revision_id}",
+        }
+        revisions.append(revision_row)
+        node["current_revision_id"] = next_revision_id
+        self._capture_revision_manifest(node_id=node_id, revision_id=next_revision_id)
+        self.mark_node_edges_stale(node_id)
+        return next_revision_id
 
     def create_tag(self, graph_id: str, name: str) -> str:
         if self.get_graph(graph_id) is None:
@@ -719,6 +957,25 @@ class InMemoryMetaStore:
             if key[0] in chunk_id_set:
                 self._chunk_embeddings.pop(key, None)
 
+    def _capture_revision_manifest(self, *, node_id: str, revision_id: str) -> None:
+        rows = [
+            item
+            for item in self._content_items.values()
+            if str(item["node_id"]) == node_id and item["deleted_at"] is None
+        ]
+        rows.sort(key=lambda item: (str(item["created_at"]), str(item["content_item_id"])))
+        self._revision_content_manifest[revision_id] = [
+            str(item["content_item_id"])
+            for item in rows
+        ]
+
+    def _require_revision(self, *, node_id: str, revision_id: str) -> Mapping[str, Any]:
+        revisions = self._revisions_by_node.get(node_id, [])
+        for revision in revisions:
+            if str(revision["revision_id"]) == revision_id:
+                return dict(revision)
+        raise KeyError(f"Revision not found: {revision_id}")
+
 
 class InMemoryVectorIndex:
     def __init__(self, _: Mapping[str, Any] | None = None) -> None:
@@ -857,12 +1114,34 @@ class PlainTextExtractor:
 
 
 class BasicExtractorV1:
-    def __init__(self, _: Mapping[str, Any] | None = None) -> None:
+    def __init__(self, options: Mapping[str, Any] | None = None) -> None:
+        options = options or {}
         self._text_mimes = {"text/plain", "text/markdown"}
         self._pdf_mimes = {"application/pdf"}
         self._image_mimes = {"image/png", "image/jpeg", "image/webp"}
         self._audio_mimes = {"audio/mpeg", "audio/mp3", "audio/wav", "audio/ogg"}
         self._video_mimes = {"video/mp4", "video/webm", "video/quicktime"}
+        self._enable_image_ocr = _read_bool_option(options, "enable_image_ocr", default=True)
+        self._enable_audio_asr = _read_bool_option(options, "enable_audio_asr", default=True)
+        self._ocr_lang = str(options.get("ocr_lang", "eng")).strip() or "eng"
+        self._ocr_backend = _normalize_ocr_backend_option(options)
+        self._ocr_device = str(options.get("ocr_device", "cpu")).strip() or "cpu"
+        self._ocr_strict_language = _read_bool_option(
+            options,
+            "ocr_strict_language",
+            default=False,
+        )
+        self._ocr_languages = _read_ocr_languages_option(options, fallback=self._ocr_lang)
+        self._ocr_profiles = _read_ocr_profiles_option(options)
+        self._ocr_active_profile = _resolve_ocr_active_profile(options, self._ocr_profiles)
+        self._ppocr_runtime_cache: dict[tuple[str, str, str], Any] = {}
+        self._asr_model = str(options.get("asr_model", "small")).strip() or "small"
+        self._asr_languages = _read_language_codes_option(options, "asr_languages")
+        if not self._asr_languages:
+            legacy_language = str(options.get("asr_language", "")).strip().lower()
+            if legacy_language:
+                self._asr_languages = [legacy_language]
+        self._asr_device = str(options.get("asr_device", "")).strip() or None
         self._supported_mime_types = (
             self._text_mimes
             | self._pdf_mimes
@@ -883,7 +1162,68 @@ class BasicExtractorV1:
                 self._supported_mime_types
             ),
             "outputs": ["text", "thumbnail", "metadata"],
+            "ocr_enabled": self._enable_image_ocr,
+            "audio_asr_enabled": self._enable_audio_asr,
+            "ocr_backend": self._ocr_backend,
+            "ocr_device": self._ocr_device,
+            "ocr_profiles": sorted(self._ocr_profiles),
+            "ocr_active_profile": self._ocr_active_profile,
+            "ocr_default_profile": "mobile_optional",
+            "ocr_languages": list(self._ocr_languages),
+            "ocr_language_mode": ("default" if not self._ocr_languages else "hinted"),
+            "ocr_supported_languages": _ppocr_supported_languages(),
+            "audio_asr_backend": "whisper",
+            "audio_asr_model": self._asr_model,
+            "audio_asr_default_model": "small",
+            "audio_asr_supported_models": _whisper_supported_models(),
+            "audio_asr_language_mode": ("auto" if not self._asr_languages else "hinted"),
+            "audio_asr_configured_languages": list(self._asr_languages),
+            "audio_asr_supported_languages": _whisper_supported_language_codes(),
         }
+
+    def list_ocr_profiles(self) -> list[Mapping[str, Any]]:
+        payload: list[Mapping[str, Any]] = []
+        for profile_name in sorted(self._ocr_profiles):
+            profile = self._ocr_profiles[profile_name]
+            payload.append(
+                {
+                    "profile_name": profile_name,
+                    "text_detection_model_name": str(profile["text_detection_model_name"]),
+                    "text_recognition_model_name": str(profile["text_recognition_model_name"]),
+                    "use_doc_orientation_classify": bool(profile["use_doc_orientation_classify"]),
+                    "use_doc_unwarping": bool(profile["use_doc_unwarping"]),
+                    "use_textline_orientation": bool(profile["use_textline_orientation"]),
+                    "is_active": profile_name == self._ocr_active_profile,
+                }
+            )
+        return payload
+
+    def get_active_ocr_profile(self) -> Mapping[str, Any]:
+        profile = self._ocr_profiles[self._ocr_active_profile]
+        return {
+            "profile_name": self._ocr_active_profile,
+            "ocr_backend": self._ocr_backend,
+            "ocr_device": self._ocr_device,
+            "ocr_languages": list(self._ocr_languages),
+            "ocr_language_mode": ("default" if not self._ocr_languages else "hinted"),
+            "text_detection_model_name": str(profile["text_detection_model_name"]),
+            "text_recognition_model_name": str(profile["text_recognition_model_name"]),
+            "use_doc_orientation_classify": bool(profile["use_doc_orientation_classify"]),
+            "use_doc_unwarping": bool(profile["use_doc_unwarping"]),
+            "use_textline_orientation": bool(profile["use_textline_orientation"]),
+        }
+
+    def set_active_ocr_profile(self, profile_name: str) -> Mapping[str, Any]:
+        normalized = profile_name.strip().lower()
+        if not normalized:
+            raise ValueError("OCR profile name must not be empty.")
+        if normalized not in self._ocr_profiles:
+            known = ", ".join(sorted(self._ocr_profiles))
+            raise ValueError(
+                f"Unknown OCR profile '{profile_name}'. Known profiles: {known}"
+            )
+        self._ocr_active_profile = normalized
+        return self.get_active_ocr_profile()
 
     def supports_mime(self, mime_type: str) -> bool:
         return mime_type in self._supported_mime_types
@@ -905,27 +1245,835 @@ class BasicExtractorV1:
             )
         if mime_type in self._image_mimes:
             digest = hashlib.sha256(content).hexdigest()
+            extracted_text = ""
+            metadata: dict[str, str] = {
+                "source_mime_type": mime_type,
+                "thumbnail_checksum": digest,
+                "source_size_bytes": str(len(content)),
+            }
+            if self._enable_image_ocr:
+                ocr_text, ocr_metadata = _run_image_ocr(
+                    content,
+                    backend=self._ocr_backend,
+                    lang=self._ocr_lang,
+                    languages=self._ocr_languages,
+                    device=self._ocr_device,
+                    strict_language=self._ocr_strict_language,
+                    profile_name=self._ocr_active_profile,
+                    profiles=self._ocr_profiles,
+                    runtime_cache=self._ppocr_runtime_cache,
+                )
+                extracted_text = ocr_text
+                metadata.update(ocr_metadata)
+            else:
+                metadata["ocr_status"] = "disabled"
             return ExtractedArtifact(
                 content_type="image/thumbnail",
-                text=None,
-                metadata={
-                    "source_mime_type": mime_type,
-                    "thumbnail_checksum": digest,
-                    "source_size_bytes": str(len(content)),
-                },
+                text=(extracted_text or None),
+                metadata=metadata,
             )
-        if mime_type in self._audio_mimes or mime_type in self._video_mimes:
-            media_type = "audio" if mime_type in self._audio_mimes else "video"
+        if mime_type in self._audio_mimes:
+            transcript = ""
+            metadata = {
+                "source_mime_type": mime_type,
+                "media_type": "audio",
+                "source_size_bytes": str(len(content)),
+            }
+            if self._enable_audio_asr:
+                asr_text, asr_metadata = _run_audio_asr(
+                    content,
+                    mime_type=mime_type,
+                    model=self._asr_model,
+                    languages=self._asr_languages,
+                    device=self._asr_device,
+                )
+                transcript = asr_text
+                metadata.update(asr_metadata)
+            else:
+                metadata["asr_status"] = "disabled"
             return ExtractedArtifact(
-                content_type=f"{media_type}/metadata",
+                content_type="audio/metadata",
+                text=(transcript or None),
+                metadata=metadata,
+            )
+        if mime_type in self._video_mimes:
+            return ExtractedArtifact(
+                content_type="video/metadata",
                 text=None,
                 metadata={
                     "source_mime_type": mime_type,
-                    "media_type": media_type,
+                    "media_type": "video",
                     "source_size_bytes": str(len(content)),
                 },
             )
         raise ValueError(f"Unsupported MIME type: {mime_type}")
+
+
+def _read_bool_option(
+    options: Mapping[str, Any],
+    key: str,
+    *,
+    default: bool,
+) -> bool:
+    raw_value = options.get(key, default)
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int):
+        return bool(raw_value)
+    if raw_value is None:
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _read_language_codes_option(
+    options: Mapping[str, Any],
+    key: str,
+    *,
+    split_plus: bool = False,
+) -> list[str]:
+    raw_value = options.get(key)
+    if raw_value is None:
+        return []
+
+    if isinstance(raw_value, str):
+        delimiter_pattern = r"[,;\s+]+" if split_plus else r"[,;\s]+"
+        candidates = [part for part in re.split(delimiter_pattern, raw_value) if part]
+    elif isinstance(raw_value, Sequence) and not isinstance(raw_value, str | bytes | bytearray):
+        candidates = [str(part) for part in raw_value]
+    else:
+        candidates = [str(raw_value)]
+
+    seen: set[str] = set()
+    normalized_values: list[str] = []
+    for candidate in candidates:
+        normalized = candidate.strip().lower()
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        normalized_values.append(normalized)
+    return normalized_values
+
+
+def _read_ocr_languages_option(
+    options: Mapping[str, Any],
+    *,
+    fallback: str,
+) -> list[str]:
+    configured = _read_language_codes_option(options, "ocr_languages", split_plus=True)
+    if configured:
+        return configured
+    if fallback.strip():
+        return _read_language_codes_option({"value": fallback}, "value", split_plus=True)
+    return []
+
+
+def _normalize_ocr_backend_option(options: Mapping[str, Any]) -> str:
+    raw_backend = str(options.get("ocr_backend", "ppocr_v5")).strip().lower()
+    if not raw_backend or raw_backend in {"ppocr_v5", "ppocr"}:
+        return "ppocr_v5"
+    raise ValueError(
+        f"Unsupported OCR backend '{raw_backend}'. Only 'ppocr_v5' is supported."
+    )
+
+
+def _read_ocr_profiles_option(options: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    profiles: dict[str, dict[str, Any]] = {
+        name: dict(profile)
+        for name, profile in _default_ocr_profiles().items()
+    }
+    raw_profiles = options.get("ocr_profiles")
+    if not isinstance(raw_profiles, Mapping):
+        return profiles
+
+    for raw_profile_name, raw_profile_config in raw_profiles.items():
+        profile_name = str(raw_profile_name).strip().lower()
+        if not profile_name:
+            continue
+        existing = profiles.get(profile_name)
+        profiles[profile_name] = _normalize_ocr_profile(
+            raw_profile_config,
+            base_profile=existing,
+        )
+    return profiles
+
+
+def _resolve_ocr_active_profile(
+    options: Mapping[str, Any],
+    profiles: Mapping[str, Mapping[str, Any]],
+) -> str:
+    candidate = str(options.get("ocr_profile", "mobile_optional")).strip().lower()
+    if candidate in profiles:
+        return candidate
+    return "mobile_optional" if "mobile_optional" in profiles else sorted(profiles)[0]
+
+
+def _default_ocr_profiles() -> dict[str, dict[str, Any]]:
+    return {
+        "mobile": {
+            "text_detection_model_name": "PP-OCRv5_mobile_det",
+            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        },
+        "mobile_optional": {
+            "text_detection_model_name": "PP-OCRv5_mobile_det",
+            "text_recognition_model_name": "PP-OCRv5_mobile_rec",
+            "use_doc_orientation_classify": True,
+            "use_doc_unwarping": True,
+            "use_textline_orientation": True,
+        },
+        "server": {
+            "text_detection_model_name": "PP-OCRv5_server_det",
+            "text_recognition_model_name": "PP-OCRv5_server_rec",
+            "use_doc_orientation_classify": False,
+            "use_doc_unwarping": False,
+            "use_textline_orientation": False,
+        },
+        "server_optional": {
+            "text_detection_model_name": "PP-OCRv5_server_det",
+            "text_recognition_model_name": "PP-OCRv5_server_rec",
+            "use_doc_orientation_classify": True,
+            "use_doc_unwarping": True,
+            "use_textline_orientation": True,
+        },
+    }
+
+
+def _normalize_ocr_profile(
+    raw_profile: Any,
+    *,
+    base_profile: Mapping[str, Any] | None,
+) -> dict[str, Any]:
+    baseline = dict(base_profile or {})
+    if not isinstance(raw_profile, Mapping):
+        return baseline
+
+    detection_model = str(
+        raw_profile.get(
+            "text_detection_model_name",
+            raw_profile.get(
+                "det_model",
+                baseline.get("text_detection_model_name", "PP-OCRv5_mobile_det"),
+            ),
+        )
+    ).strip()
+    recognition_model = str(
+        raw_profile.get(
+            "text_recognition_model_name",
+            raw_profile.get(
+                "rec_model",
+                baseline.get("text_recognition_model_name", "PP-OCRv5_mobile_rec"),
+            ),
+        )
+    ).strip()
+    return {
+        "text_detection_model_name": detection_model or "PP-OCRv5_mobile_det",
+        "text_recognition_model_name": recognition_model or "PP-OCRv5_mobile_rec",
+        "use_doc_orientation_classify": _coerce_bool(
+            raw_profile.get(
+                "use_doc_orientation_classify",
+                baseline.get("use_doc_orientation_classify", False),
+            ),
+            default=False,
+        ),
+        "use_doc_unwarping": _coerce_bool(
+            raw_profile.get(
+                "use_doc_unwarping",
+                baseline.get("use_doc_unwarping", False),
+            ),
+            default=False,
+        ),
+        "use_textline_orientation": _coerce_bool(
+            raw_profile.get(
+                "use_textline_orientation",
+                baseline.get("use_textline_orientation", False),
+            ),
+            default=False,
+        ),
+    }
+
+
+def _coerce_bool(raw_value: Any, *, default: bool) -> bool:
+    if isinstance(raw_value, bool):
+        return raw_value
+    if isinstance(raw_value, int):
+        return bool(raw_value)
+    if raw_value is None:
+        return default
+    normalized = str(raw_value).strip().lower()
+    if normalized in {"1", "true", "t", "yes", "y", "on"}:
+        return True
+    if normalized in {"0", "false", "f", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _ppocr_supported_languages() -> list[str]:
+    # Mirrors the language codes documented for PP-OCRv5 multilingual recognition.
+    return [
+        "af",
+        "be",
+        "bs",
+        "ch",
+        "chinese_cht",
+        "cs",
+        "cy",
+        "da",
+        "de",
+        "en",
+        "es",
+        "et",
+        "fr",
+        "ga",
+        "hr",
+        "hu",
+        "id",
+        "is",
+        "it",
+        "japan",
+        "korean",
+        "la",
+        "lt",
+        "mi",
+        "ms",
+        "nl",
+        "no",
+        "oc",
+        "pl",
+        "pt",
+        "ru",
+        "rslatin",
+        "sk",
+        "sl",
+        "sq",
+        "sv",
+        "sw",
+        "tl",
+        "tr",
+        "uk",
+        "uz",
+    ]
+
+
+def _normalize_ppocr_language_code(raw_language: str) -> str:
+    normalized = raw_language.strip().lower()
+    aliases = {
+        "auto": "",
+        "default": "",
+        "eng": "en",
+        "english": "en",
+        "ru": "ru",
+        "rus": "ru",
+        "russian": "ru",
+        "deu": "de",
+        "ger": "de",
+        "deutsch": "de",
+        "fra": "fr",
+        "fre": "fr",
+        "francais": "fr",
+        "spa": "es",
+        "espanol": "es",
+        "ita": "it",
+        "jpn": "japan",
+        "kor": "korean",
+        "chi_sim": "ch",
+        "zh-cn": "ch",
+        "zh": "ch",
+        "chi_tra": "chinese_cht",
+        "zh-tw": "chinese_cht",
+        "pt-br": "pt",
+    }
+    return aliases.get(normalized, normalized)
+
+
+def _run_image_ocr(
+    content: bytes,
+    *,
+    backend: str,
+    lang: str,
+    languages: Sequence[str],
+    device: str,
+    strict_language: bool,
+    profile_name: str,
+    profiles: Mapping[str, Mapping[str, Any]],
+    runtime_cache: dict[tuple[str, str, str], Any],
+) -> tuple[str, dict[str, str]]:
+    normalized_backend = backend.strip().lower() or "ppocr_v5"
+    if normalized_backend not in {"ppocr_v5", "ppocr"}:
+        return (
+            "",
+            {
+                "ocr_status": "error",
+                "ocr_backend": normalized_backend,
+                "ocr_error": (
+                    f"Unsupported OCR backend: {normalized_backend}. "
+                    "Only ppocr_v5 is supported."
+                ),
+            },
+        )
+    return _run_image_ocr_ppocr(
+        content,
+        lang=lang,
+        languages=languages,
+        device=device,
+        strict_language=strict_language,
+        profile_name=profile_name,
+        profiles=profiles,
+        runtime_cache=runtime_cache,
+    )
+
+
+def _run_image_ocr_ppocr(
+    content: bytes,
+    *,
+    lang: str,
+    languages: Sequence[str],
+    device: str,
+    strict_language: bool,
+    profile_name: str,
+    profiles: Mapping[str, Mapping[str, Any]],
+    runtime_cache: dict[tuple[str, str, str], Any],
+) -> tuple[str, dict[str, str]]:
+    profile = profiles.get(profile_name)
+    metadata: dict[str, str] = {
+        "ocr_status": "attempted",
+        "ocr_backend": "ppocr_v5",
+        "ocr_profile": profile_name,
+        "ocr_device": device or "cpu",
+    }
+    if profile is None:
+        metadata["ocr_status"] = "error"
+        metadata["ocr_error"] = f"Unknown OCR profile: {profile_name}"
+        return "", metadata
+
+    supported_languages = set(_ppocr_supported_languages())
+    candidates: list[str] = []
+    rejected_languages: list[str] = []
+    raw_candidates = list(languages)
+    if not raw_candidates and lang.strip():
+        raw_candidates = _read_language_codes_option({"value": lang}, "value", split_plus=True)
+    for raw_language in raw_candidates:
+        normalized_language = _normalize_ppocr_language_code(raw_language)
+        if not normalized_language:
+            continue
+        if normalized_language in supported_languages:
+            if normalized_language not in candidates:
+                candidates.append(normalized_language)
+        else:
+            rejected_languages.append(str(raw_language).strip().lower())
+    if rejected_languages:
+        metadata["ocr_unsupported_languages"] = ",".join(rejected_languages)
+        if strict_language:
+            metadata["ocr_status"] = "error"
+            metadata["ocr_error"] = (
+                "Unsupported OCR language hints: " + ", ".join(rejected_languages)
+            )
+            return "", metadata
+    metadata["ocr_language_mode"] = "hinted" if candidates else "default"
+    if candidates:
+        metadata["ocr_language_hints"] = ",".join(candidates)
+
+    try:
+        paddleocr_module = importlib.import_module("paddleocr")
+    except Exception as error:  # noqa: BLE001
+        metadata["ocr_status"] = "unavailable"
+        metadata["ocr_error"] = _format_error(error)
+        return "", metadata
+
+    best_text = ""
+    best_score = float("-inf")
+    best_language: str | None = None
+    runtime_warnings: list[str] = []
+    candidate_errors: list[str] = []
+    languages_to_try = candidates if candidates else [""]
+    try:
+        for candidate_language in languages_to_try:
+            try:
+                runtime, skipped_kwargs = _get_ppocr_runtime(
+                    paddleocr_module=paddleocr_module,
+                    profile_name=profile_name,
+                    profile=profile,
+                    device=(device or "cpu"),
+                    language_hint=(candidate_language or None),
+                    runtime_cache=runtime_cache,
+                )
+                if skipped_kwargs:
+                    runtime_warnings.append(",".join(skipped_kwargs))
+                raw_result = _run_ppocr_predict(runtime, content)
+                candidate_text, candidate_score = _extract_ppocr_text_and_score(raw_result)
+            except Exception as candidate_error:  # noqa: BLE001
+                candidate_errors.append(
+                    f"{candidate_language or 'default'}:"
+                    f"{_format_error(candidate_error, max_length=96)}"
+                )
+                continue
+            if candidate_score > best_score:
+                best_score = candidate_score
+                best_text = candidate_text
+                best_language = candidate_language or None
+    except Exception as error:  # noqa: BLE001
+        metadata["ocr_status"] = "error"
+        metadata["ocr_error"] = _format_error(error)
+        return "", metadata
+
+    if candidate_errors:
+        metadata["ocr_hint_errors"] = "; ".join(candidate_errors)
+    if runtime_warnings:
+        metadata["ocr_runtime_skipped_kwargs"] = "; ".join(sorted(set(runtime_warnings)))
+    if best_score == float("-inf"):
+        metadata["ocr_status"] = "error"
+        metadata["ocr_error"] = "PP-OCRv5 produced no result."
+        return "", metadata
+    metadata["ocr_status"] = "ok"
+    metadata["ocr_text_length"] = str(len(best_text))
+    if best_language:
+        metadata["ocr_selected_language"] = best_language
+    return best_text, metadata
+
+
+def _get_ppocr_runtime(
+    *,
+    paddleocr_module: Any,
+    profile_name: str,
+    profile: Mapping[str, Any],
+    device: str,
+    language_hint: str | None,
+    runtime_cache: dict[tuple[str, str, str], Any],
+) -> tuple[Any, list[str]]:
+    cache_key = (profile_name, device, language_hint or "")
+    cached = runtime_cache.get(cache_key)
+    if cached is not None:
+        return cached, []
+
+    paddle_ocr_cls = getattr(paddleocr_module, "PaddleOCR", None)
+    if paddle_ocr_cls is None:
+        raise RuntimeError("paddleocr.PaddleOCR class is unavailable.")
+    supported_kwargs = _callable_parameter_names(paddle_ocr_cls)
+
+    requested_kwargs: dict[str, Any] = {
+        "ocr_version": "PP-OCRv5",
+        "device": device,
+        "text_detection_model_name": str(profile["text_detection_model_name"]),
+        "text_recognition_model_name": str(profile["text_recognition_model_name"]),
+        "use_doc_orientation_classify": bool(profile["use_doc_orientation_classify"]),
+        "use_doc_unwarping": bool(profile["use_doc_unwarping"]),
+        "use_textline_orientation": bool(profile["use_textline_orientation"]),
+    }
+    if language_hint:
+        requested_kwargs["lang"] = language_hint
+
+    skipped_kwargs: list[str] = []
+    init_kwargs: dict[str, Any] = {}
+    for key, value in requested_kwargs.items():
+        if supported_kwargs is None or key in supported_kwargs:
+            init_kwargs[key] = value
+        else:
+            skipped_kwargs.append(key)
+    runtime = paddle_ocr_cls(**init_kwargs)
+    runtime_cache[cache_key] = runtime
+    return runtime, skipped_kwargs
+
+
+def _callable_parameter_names(callable_obj: Any) -> set[str] | None:
+    try:
+        signature = inspect.signature(callable_obj)
+    except Exception:
+        return None
+
+    names: set[str] = set()
+    for parameter in signature.parameters.values():
+        if parameter.name == "self":
+            continue
+        if parameter.kind == inspect.Parameter.VAR_KEYWORD:
+            return None
+        names.add(parameter.name)
+    return names
+
+
+def _run_ppocr_predict(runtime: Any, content: bytes) -> Any:
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="wb", suffix=".png", delete=False) as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        predict_fn = getattr(runtime, "predict", None)
+        if callable(predict_fn):
+            return predict_fn(temp_path)
+        ocr_fn = getattr(runtime, "ocr", None)
+        if callable(ocr_fn):
+            return ocr_fn(temp_path)
+        raise RuntimeError("PaddleOCR runtime does not expose predict/ocr API.")
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _extract_ppocr_text_and_score(raw_result: Any) -> tuple[str, float]:
+    queue: deque[Any] = deque([raw_result])
+    texts: list[str] = []
+    scores: list[float] = []
+
+    while queue:
+        item = queue.popleft()
+        if isinstance(item, Mapping):
+            rec_texts = item.get("rec_texts")
+            if isinstance(rec_texts, Sequence) and not isinstance(
+                rec_texts,
+                str | bytes | bytearray,
+            ):
+                for text_item in rec_texts:
+                    text_value = str(text_item).strip()
+                    if text_value:
+                        texts.append(text_value)
+
+            rec_scores = item.get("rec_scores")
+            if isinstance(rec_scores, Sequence) and not isinstance(
+                rec_scores,
+                str | bytes | bytearray,
+            ):
+                for score_value in rec_scores:
+                    if isinstance(score_value, int | float):
+                        scores.append(float(score_value))
+
+            single_text = item.get("text")
+            if isinstance(single_text, str) and single_text.strip():
+                texts.append(single_text.strip())
+
+            for nested_key in ("res", "result", "results", "output", "outputs", "data"):
+                nested_payload = item.get(nested_key)
+                if isinstance(nested_payload, Mapping):
+                    queue.append(nested_payload)
+                elif isinstance(nested_payload, Sequence) and not isinstance(
+                    nested_payload,
+                    str | bytes | bytearray,
+                ):
+                    queue.extend(nested_payload)
+            continue
+
+        if isinstance(item, Sequence) and not isinstance(item, str | bytes | bytearray):
+            if (
+                len(item) >= 2
+                and isinstance(item[1], Sequence)
+                and not isinstance(item[1], str | bytes | bytearray)
+            ):
+                pair = item[1]
+                if len(pair) >= 1 and isinstance(pair[0], str) and pair[0].strip():
+                    texts.append(pair[0].strip())
+                if len(pair) >= 2 and isinstance(pair[1], int | float):
+                    scores.append(float(pair[1]))
+            queue.extend(item)
+
+    normalized_texts: list[str] = []
+    for text in texts:
+        normalized = " ".join(text.split())
+        if not normalized:
+            continue
+        normalized_texts.append(normalized)
+
+    combined = "\n".join(normalized_texts).strip()
+    if not combined:
+        return "", 0.0
+    if scores:
+        return combined, sum(scores) / float(len(scores))
+    return combined, min(1.0, float(len(combined)) / 600.0)
+
+
+def _run_audio_asr(
+    content: bytes,
+    *,
+    mime_type: str,
+    model: str,
+    languages: Sequence[str] | None = None,
+    device: str | None = None,
+) -> tuple[str, dict[str, str]]:
+    model_id = model.strip() or "small"
+    language_hints = [lang.strip().lower() for lang in (languages or []) if lang.strip()]
+    metadata = {
+        "asr_status": "attempted",
+        "asr_backend": "whisper",
+        "asr_model": model_id,
+        "asr_language_mode": ("auto" if not language_hints else "hinted"),
+    }
+    if language_hints:
+        metadata["asr_language_hints"] = ",".join(language_hints)
+    if device:
+        metadata["asr_device"] = device
+    try:
+        whisper_module = importlib.import_module("whisper")
+    except Exception as error:  # noqa: BLE001
+        metadata["asr_status"] = "unavailable"
+        metadata["asr_error"] = _format_error(error)
+        return "", metadata
+
+    temp_path: str | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=_audio_suffix_for_mime(mime_type),
+            delete=False,
+        ) as temp_file:
+            temp_file.write(content)
+            temp_path = temp_file.name
+
+        load_kwargs: dict[str, str] = {}
+        if device:
+            load_kwargs["device"] = device
+        whisper_model = whisper_module.load_model(model_id, **load_kwargs)
+
+        raw_result: Any
+        if not language_hints:
+            raw_result = whisper_model.transcribe(temp_path)
+        else:
+            best_result: Any = None
+            best_score = float("-inf")
+            best_language: str | None = None
+            candidate_errors: list[str] = []
+            for hinted_language in language_hints:
+                try:
+                    candidate = whisper_model.transcribe(
+                        temp_path,
+                        language=hinted_language,
+                    )
+                except Exception as candidate_error:  # noqa: BLE001
+                    candidate_errors.append(
+                        f"{hinted_language}:{_format_error(candidate_error, max_length=96)}"
+                    )
+                    continue
+                candidate_score = _score_whisper_result(candidate)
+                if candidate_score > best_score:
+                    best_result = candidate
+                    best_score = candidate_score
+                    best_language = hinted_language
+
+            if best_result is None:
+                raise RuntimeError(
+                    "Whisper failed for all configured language hints."
+                )
+            raw_result = best_result
+            if best_language:
+                metadata["asr_selected_language"] = best_language
+            if candidate_errors:
+                metadata["asr_hint_errors"] = "; ".join(candidate_errors)
+
+        result_text, detected_language = _extract_whisper_result_text_and_language(raw_result)
+        metadata["asr_status"] = "ok"
+        metadata["asr_text_length"] = str(len(result_text))
+        if detected_language:
+            metadata["asr_detected_language"] = detected_language
+        return result_text, metadata
+    except Exception as error:  # noqa: BLE001
+        metadata["asr_status"] = "error"
+        metadata["asr_error"] = _format_error(error)
+        return "", metadata
+    finally:
+        if temp_path and os.path.exists(temp_path):
+            os.remove(temp_path)
+
+
+def _audio_suffix_for_mime(mime_type: str) -> str:
+    mime_to_suffix = {
+        "audio/mpeg": ".mp3",
+        "audio/mp3": ".mp3",
+        "audio/wav": ".wav",
+        "audio/ogg": ".ogg",
+    }
+    return mime_to_suffix.get(mime_type, ".audio")
+
+
+def _whisper_supported_models() -> list[str]:
+    return [
+        "tiny",
+        "tiny.en",
+        "base",
+        "base.en",
+        "small",
+        "small.en",
+        "medium",
+        "medium.en",
+        "large-v1",
+        "large-v2",
+        "large-v3",
+        "large",
+        "turbo",
+    ]
+
+
+def _whisper_supported_language_codes() -> list[str]:
+    try:
+        tokenizer_module = importlib.import_module("whisper.tokenizer")
+        raw_languages = getattr(tokenizer_module, "LANGUAGES", {})
+        if isinstance(raw_languages, Mapping):
+            return sorted(
+                str(code)
+                for code in raw_languages.keys()
+                if str(code).strip()
+            )
+    except Exception:
+        pass
+    return [
+        "de",
+        "en",
+        "es",
+        "fr",
+        "it",
+        "ja",
+        "ko",
+        "pt",
+        "ru",
+        "uk",
+        "zh",
+    ]
+
+
+def _extract_whisper_result_text_and_language(raw_result: Any) -> tuple[str, str | None]:
+    if isinstance(raw_result, Mapping):
+        text = str(raw_result.get("text", "")).strip()
+        detected = str(raw_result.get("language", "")).strip().lower() or None
+        return text, detected
+    return str(raw_result).strip(), None
+
+
+def _score_whisper_result(raw_result: Any) -> float:
+    text, _ = _extract_whisper_result_text_and_language(raw_result)
+    score = min(float(len(text)) / 600.0, 1.0)
+    if not isinstance(raw_result, Mapping):
+        return score
+
+    raw_segments = raw_result.get("segments")
+    if not isinstance(raw_segments, Sequence) or isinstance(raw_segments, str | bytes | bytearray):
+        return score
+
+    avg_logprobs: list[float] = []
+    no_speech_probs: list[float] = []
+    for segment in raw_segments:
+        if not isinstance(segment, Mapping):
+            continue
+        avg_logprob = segment.get("avg_logprob")
+        no_speech_prob = segment.get("no_speech_prob")
+        if isinstance(avg_logprob, int | float):
+            avg_logprobs.append(float(avg_logprob))
+        if isinstance(no_speech_prob, int | float):
+            no_speech_probs.append(float(no_speech_prob))
+
+    if avg_logprobs:
+        score += sum(avg_logprobs) / float(len(avg_logprobs))
+    if no_speech_probs:
+        score -= sum(no_speech_probs) / float(len(no_speech_probs))
+    return score
+
+
+def _format_error(error: Exception, *, max_length: int = 240) -> str:
+    message = f"{error.__class__.__name__}: {error}"
+    if len(message) <= max_length:
+        return message
+    return message[: max_length - 3] + "..."
 
 
 class MockEmbeddingProvider:
@@ -1031,6 +2179,25 @@ def _coerce_vector(raw: Any) -> list[float]:
     if isinstance(raw, Sequence) and not isinstance(raw, str | bytes | bytearray):
         return [float(value) for value in raw]
     raise TypeError("Embedding vector must be a sequence of floats.")
+
+
+def _validate_edge_status(status: str) -> str:
+    normalized = status.strip().lower()
+    allowed = {"pending", "accepted", "rejected", "stale", "possibly_stale"}
+    if normalized not in allowed:
+        known = ", ".join(sorted(allowed))
+        raise ValueError(f"Unsupported edge status '{status}'. Known statuses: {known}")
+    return normalized
+
+
+def _normalize_provenance(payload: Mapping[str, Any] | None) -> dict[str, Any]:
+    if payload is None:
+        return {}
+    raw = json.dumps(dict(payload), ensure_ascii=False, sort_keys=True)
+    loaded = json.loads(raw)
+    if isinstance(loaded, dict):
+        return {str(key): value for key, value in loaded.items()}
+    return {}
 
 
 def _cosine_similarity(lhs: Sequence[float], rhs: Sequence[float]) -> float:

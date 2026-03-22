@@ -15,6 +15,8 @@ from smart_journal.providers import (
     MockEmbeddingProvider,
     MockLLMProvider,
     MultilingualE5SmallEmbeddingProvider,
+    OllamaLLMProvider,
+    OpenAIChatProvider,
     PlainTextExtractor,
     SQLiteMetaStore,
     USearchFileVectorIndex,
@@ -155,6 +157,16 @@ def build_default_registry() -> ProviderRegistry:
         category="llm_provider",
         provider_id="mock_chat",
         constructor=lambda options: MockLLMProvider(options),
+    )
+    registry.register(
+        category="llm_provider",
+        provider_id="ollama_chat",
+        constructor=lambda options: OllamaLLMProvider(options),
+    )
+    registry.register(
+        category="llm_provider",
+        provider_id="openai_chat",
+        constructor=lambda options: OpenAIChatProvider(options),
     )
 
     return registry

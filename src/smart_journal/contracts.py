@@ -169,6 +169,61 @@ class MetaStore(ProviderInfo, Protocol):
 
     def mark_vector_index_ops_applied(self, op_ids: Sequence[str]) -> None: ...
 
+    def create_edge(
+        self,
+        *,
+        graph_id: str,
+        from_node_id: str,
+        to_node_id: str,
+        edge_type: str,
+        status: str = "pending",
+        weight: float | None = None,
+        subtype: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        created_by: str | None = None,
+    ) -> str: ...
+
+    def get_edge(
+        self, edge_id: str, *, include_deleted: bool = False
+    ) -> Mapping[str, Any] | None: ...
+
+    def list_edges(
+        self,
+        *,
+        graph_id: str | None = None,
+        node_id: str | None = None,
+        edge_type: str | None = None,
+        status: str | None = None,
+        include_deleted: bool = False,
+        limit: int = 200,
+    ) -> list[Mapping[str, Any]]: ...
+
+    def update_edge(
+        self,
+        edge_id: str,
+        *,
+        status: str | None = None,
+        weight: float | None = None,
+        provenance: Mapping[str, Any] | None = None,
+    ) -> None: ...
+
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None: ...
+
+    def mark_node_edges_stale(self, node_id: str) -> int: ...
+
+    def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str: ...
+
+    def get_revision_manifest(
+        self, node_id: str, revision_id: str
+    ) -> list[Mapping[str, Any]]: ...
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]: ...
+
     def create_tag(self, graph_id: str, name: str) -> str: ...
 
     def list_tags(
