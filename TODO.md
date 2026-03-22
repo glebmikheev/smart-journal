@@ -13,3 +13,13 @@
 - [ ] Heavy: add native multimodal embeddings (image/audio/video) instead of text-only fallback.
 - [ ] Heavy: add cross-modal retrieval/ranking policy and score fusion.
 - [ ] Heavy: add performance profile + batching + async workers for heavy media.
+
+## Quality and Validation Backlog
+
+- [ ] Add UI e2e coverage for critical flows (graph/node CRUD, explore, edge actions).
+- [ ] Add performance/load tests for ingestion, FTS, and vector query latencies.
+- [ ] Add CI smoke jobs against live external services (OpenAI API, PP-OCRv5/Whisper runtime checks).
+
+## Graph Correctness Backlog
+
+- [ ] Implement evidence-aware implication staleness: mark implication edge `stale` only when its provenance evidence chunks changed, not for every edge touching an updated node.

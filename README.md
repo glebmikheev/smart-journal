@@ -61,6 +61,14 @@ smart-journal providers
 smart-journal run
 ```
 
+Default install includes OCR/ASR/OpenAI runtime dependencies.
+If you need a minimal install, exclude dependency resolution explicitly:
+
+```powershell
+python -m pip install -e . --no-deps
+python -m pip install sentence-transformers
+```
+
 Run web API:
 
 ```powershell
@@ -152,11 +160,19 @@ Runtime OCR profile API:
 - `GET /api/ocr/profiles` - list profiles and active profile.
 - `POST /api/ocr/active` with `{"profile":"server"}` - switch active OCR profile.
 
+## Preflight Check
+
+Run dependency checks before smoke/live runs:
+
+```powershell
+smart-journal preflight --json
+smart-journal preflight --profile ocr --profile asr --profile llm --strict --json
+```
+
 PP-OCRv5 prerequisites (optional, for real OCR inference):
 
 ```powershell
-python -m pip install paddlepaddle==3.2.0
-python -m pip install paddleocr
+python -m pip install -e .
 ```
 
 This project uses `PP-OCRv5` only for OCR (no `tesseract/pytesseract` backend).
@@ -185,6 +201,31 @@ python scripts/smoke_ocr.py --image .\samples\ocr1.png --image .\samples\ocr2.jp
 ```
 
 Expected: JSON report with `summary.ok >= 1` and `samples[*].ocr_status == "ok"` for at least one image.
+
+## ASR Smoke Check
+
+ASR prerequisites:
+
+```powershell
+python -m pip install -e .
+ffmpeg -version
+```
+
+Run ASR smoke with auto-generated WAV sample:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_asr.py --asr-model small
+```
+
+Run ASR smoke with local audio files:
+
+```powershell
+$env:PYTHONPATH="src"
+python scripts/smoke_asr.py --audio .\samples\voice1.wav --audio .\samples\voice2.mp3 --asr-languages en,ru
+```
+
+Expected: JSON report with `summary.ok >= 1` and `samples[*].asr_status == "ok"` for at least one audio file.
 
 Optional local Ollama backend:
 
