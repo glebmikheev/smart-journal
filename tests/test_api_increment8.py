@@ -10,6 +10,37 @@ from smart_journal.web.app import create_app
 
 
 class IncrementEightApiIntegrationTests(unittest.TestCase):
+    def test_ocr_profile_api_switches_active_profile(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            with self._client(Path(tmp_dir)) as client:
+                list_response = client.get("/api/ocr/profiles")
+                self.assertEqual(list_response.status_code, 200)
+                list_payload = list_response.json()
+                self.assertTrue(bool(list_payload.get("supported")))
+                active_profile = list_payload.get("active_profile", {})
+                self.assertEqual(str(active_profile.get("profile_name")), "mobile_optional")
+
+                profiles = list_payload.get("profiles", [])
+                self.assertIsInstance(profiles, list)
+                profile_names = {str(item.get("profile_name")) for item in profiles}
+                self.assertIn("mobile_optional", profile_names)
+                self.assertIn("server_optional", profile_names)
+
+                switch_response = client.post(
+                    "/api/ocr/active",
+                    json={"profile": "server"},
+                )
+                self.assertEqual(switch_response.status_code, 200)
+                switched_payload = switch_response.json()
+                switched_active = switched_payload.get("active_profile", {})
+                self.assertEqual(str(switched_active.get("profile_name")), "server")
+
+                selected_response = client.get("/api/providers/selected")
+                self.assertEqual(selected_response.status_code, 200)
+                selected_payload = selected_response.json()
+                extractor_caps = selected_payload["extractor"]["capabilities"]
+                self.assertEqual(str(extractor_caps.get("ocr_active_profile")), "server")
+
     def test_manual_association_edge_crud_endpoints(self) -> None:
         with tempfile.TemporaryDirectory() as tmp_dir:
             with self._client(Path(tmp_dir)) as client:

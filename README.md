@@ -21,7 +21,7 @@ Increment 8 baseline for the Smart Journal knowledge base (with API hardening).
 - extractor backend `basic_v1`:
   - plain text / markdown
   - PDF -> text
-  - image -> thumbnail metadata + optional OCR text (best-effort)
+  - image -> thumbnail metadata + optional OCR text (PP-OCRv5 profiles with runtime switch API)
   - audio -> metadata + optional ASR transcript (best-effort)
   - video -> metadata-only (video OCR/ASR tracked in `TODO.md`)
 - ingestion pipeline with chunking (`chunk_size`, `chunk_overlap`) + SHA-256 checksum
@@ -127,7 +127,12 @@ backend = "basic_v1"
 # Optional multimodal extraction controls
 enable_image_ocr = true
 enable_audio_asr = true
-ocr_lang = "eng"
+ocr_backend = "ppocr_v5"
+ocr_profile = "mobile_optional"
+ocr_device = "cpu"
+# ocr_languages = ["en", "ru"]  # optional language hints
+# ocr_strict_language = false
+# ocr_lang = "eng"              # legacy fallback if ocr_languages is omitted
 asr_model = "small"
 # asr_languages = ["en", "ru"]  # optional language hints; omit for auto-detect
 # asr_device = "cpu"
@@ -140,6 +145,18 @@ batch_size = 32
 
 [llm_provider]
 backend = "mock_chat"
+```
+
+Runtime OCR profile API:
+
+- `GET /api/ocr/profiles` - list profiles and active profile.
+- `POST /api/ocr/active` with `{"profile":"server"}` - switch active OCR profile.
+
+PP-OCRv5 prerequisites (optional, for real OCR inference):
+
+```powershell
+python -m pip install paddlepaddle==3.2.0
+python -m pip install paddleocr
 ```
 
 Optional local Ollama backend:
