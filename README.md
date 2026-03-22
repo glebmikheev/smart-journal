@@ -159,6 +159,15 @@ python -m pip install paddlepaddle==3.2.0
 python -m pip install paddleocr
 ```
 
+This project uses `PP-OCRv5` only for OCR (no `tesseract/pytesseract` backend).
+
+If your user profile directories are not writable, set local runtime caches:
+
+```powershell
+$env:PADDLE_HOME="$PWD\\.runtime\\paddle"
+$env:PADDLE_PDX_CACHE_HOME="$PWD\\.runtime\\paddlex"
+```
+
 ## OCR Smoke Check
 
 Run OCR smoke with auto-generated sample image:
