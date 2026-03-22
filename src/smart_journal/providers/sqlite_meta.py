@@ -119,6 +119,7 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
             self._refresh_node_search_index(node_id)
         return node_id
 
@@ -152,7 +153,9 @@ class SQLiteMetaStore:
                 "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
                 (revision_id, node_id),
             )
+            self._capture_revision_manifest(node_id=node_id, revision_id=revision_id)
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
 
     def delete_node(self, node_id: str, *, soft_delete: bool = True) -> None:
         if soft_delete:
@@ -206,6 +209,52 @@ class SQLiteMetaStore:
         payload: list[Mapping[str, Any]] = [_row_to_dict(row) for row in rows]
         return payload
 
+    def get_revision_manifest(
+        self,
+        node_id: str,
+        revision_id: str,
+    ) -> list[Mapping[str, Any]]:
+        _ = self._require_revision(node_id=node_id, revision_id=revision_id)
+        rows = self._connection.execute(
+            """
+            SELECT
+                rcm.content_item_id,
+                rcm.position,
+                ci.filename,
+                ci.mime_type,
+                ci.blob_hash,
+                ci.blob_size
+            FROM revision_content_manifest rcm
+            INNER JOIN content_items ci ON ci.content_item_id = rcm.content_item_id
+            WHERE rcm.revision_id = ?
+            ORDER BY rcm.position ASC
+            """,
+            (revision_id,),
+        ).fetchall()
+        return [_row_to_dict(row) for row in rows]
+
+    def diff_revisions(
+        self,
+        node_id: str,
+        from_revision_id: str,
+        to_revision_id: str,
+    ) -> Mapping[str, Any]:
+        from_revision = self._require_revision(node_id=node_id, revision_id=from_revision_id)
+        to_revision = self._require_revision(node_id=node_id, revision_id=to_revision_id)
+        source_manifest = self.get_revision_manifest(node_id, from_revision_id)
+        target_manifest = self.get_revision_manifest(node_id, to_revision_id)
+        source_ids = {str(row["content_item_id"]) for row in source_manifest}
+        target_ids = {str(row["content_item_id"]) for row in target_manifest}
+        return {
+            "node_id": node_id,
+            "from_revision_id": from_revision_id,
+            "to_revision_id": to_revision_id,
+            "title_changed": str(from_revision["title"]) != str(to_revision["title"]),
+            "body_changed": str(from_revision["body"]) != str(to_revision["body"]),
+            "added_content_item_ids": sorted(target_ids - source_ids),
+            "removed_content_item_ids": sorted(source_ids - target_ids),
+        }
+
     def attach_content_item(
         self,
         node_id: str,
@@ -253,6 +302,7 @@ class SQLiteMetaStore:
                 ),
             )
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
         return content_item_id
 
     def list_content_items(
@@ -306,6 +356,7 @@ class SQLiteMetaStore:
                     (timestamp, content_item_id),
                 )
                 self._refresh_node_search_index(node_id)
+                self.mark_node_edges_stale(node_id)
             return
 
         with self._connection:
@@ -318,6 +369,7 @@ class SQLiteMetaStore:
                 (content_item_id,),
             )
             self._refresh_node_search_index(node_id)
+            self.mark_node_edges_stale(node_id)
 
     def set_content_item_extraction(
         self,
@@ -409,6 +461,7 @@ class SQLiteMetaStore:
                         _utc_now(),
                     ),
                 )
+            self.mark_node_edges_stale(node_id)
         return created_ids
 
     def list_chunks(
@@ -651,6 +704,9 @@ class SQLiteMetaStore:
         edge_type: str,
         status: str = "pending",
         weight: float | None = None,
+        subtype: str | None = None,
+        provenance: Mapping[str, Any] | None = None,
+        created_by: str | None = None,
     ) -> str:
         if from_node_id == to_node_id:
             raise ValueError("Self-loop edges are not supported in alpha.")
@@ -675,13 +731,16 @@ class SQLiteMetaStore:
                     from_node_id,
                     to_node_id,
                     edge_type,
+                    subtype,
                     status,
                     weight,
+                    provenance_json,
+                    created_by,
                     created_at,
                     updated_at,
                     deleted_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
                 """,
                 (
                     edge_id,
@@ -689,8 +748,11 @@ class SQLiteMetaStore:
                     from_node_id,
                     to_node_id,
                     edge_type,
+                    (subtype.strip() if subtype is not None and subtype.strip() else None),
                     _validate_edge_status(status),
                     (float(weight) if weight is not None else None),
+                    _serialize_json_object(provenance),
+                    (created_by.strip() if created_by is not None and created_by.strip() else None),
                     timestamp,
                     timestamp,
                 ),
@@ -703,7 +765,7 @@ class SQLiteMetaStore:
         if not include_deleted:
             query += " AND deleted_at IS NULL"
         row = self._connection.execute(query, params).fetchone()
-        return _row_to_dict(row) if row is not None else None
+        return _edge_row_to_dict(row) if row is not None else None
 
     def list_edges(
         self,
@@ -739,7 +801,7 @@ class SQLiteMetaStore:
         sql_parts.append("ORDER BY updated_at DESC, edge_id DESC LIMIT ?")
         params.append(limit)
         rows = self._connection.execute("\n".join(sql_parts), tuple(params)).fetchall()
-        return [_row_to_dict(row) for row in rows]
+        return [_edge_row_to_dict(row) for row in rows]
 
     def update_edge(
         self,
@@ -747,23 +809,104 @@ class SQLiteMetaStore:
         *,
         status: str | None = None,
         weight: float | None = None,
+        provenance: Mapping[str, Any] | None = None,
     ) -> None:
         edge = self.get_edge(edge_id=edge_id)
         if edge is None:
             raise KeyError(f"Edge not found or deleted: {edge_id}")
         next_status = _validate_edge_status(status) if status is not None else str(edge["status"])
         next_weight = float(weight) if weight is not None else edge["weight"]
+        next_provenance = (
+            _serialize_json_object(provenance)
+            if provenance is not None
+            else _serialize_json_object(_as_json_mapping(edge.get("provenance")))
+        )
         with self._connection:
             self._connection.execute(
                 """
                 UPDATE edges
                 SET status = ?,
                     weight = ?,
+                    provenance_json = ?,
                     updated_at = ?
                 WHERE edge_id = ? AND deleted_at IS NULL
                 """,
-                (next_status, next_weight, _utc_now(), edge_id),
+                (next_status, next_weight, next_provenance, _utc_now(), edge_id),
             )
+
+    def delete_edge(self, edge_id: str, *, soft_delete: bool = True) -> None:
+        if soft_delete:
+            with self._connection:
+                self._connection.execute(
+                    """
+                    UPDATE edges
+                    SET deleted_at = ?,
+                        updated_at = ?
+                    WHERE edge_id = ? AND deleted_at IS NULL
+                    """,
+                    (_utc_now(), _utc_now(), edge_id),
+                )
+            return
+        with self._connection:
+            self._connection.execute(
+                "DELETE FROM edges WHERE edge_id = ?",
+                (edge_id,),
+            )
+
+    def mark_node_edges_stale(self, node_id: str) -> int:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        timestamp = _utc_now()
+        if self._connection.in_transaction:
+            return self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+        with self._connection:
+            return self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+
+    def rollback_node_to_revision(self, node_id: str, revision_id: str) -> str:
+        node = self.get_node(node_id)
+        if node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+
+        row = self._connection.execute(
+            """
+            SELECT revision_id, title, body
+            FROM revisions
+            WHERE revision_id = ? AND node_id = ?
+            """,
+            (revision_id, node_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+
+        next_revision_no = int(self._next_revision_no(node_id))
+        timestamp = _utc_now()
+        with self._connection:
+            self._connection.execute(
+                """
+                UPDATE nodes
+                SET title = ?,
+                    body = ?,
+                    updated_at = ?
+                WHERE node_id = ?
+                """,
+                (str(row["title"]), str(row["body"]), timestamp, node_id),
+            )
+            next_revision_id = self._insert_revision(
+                node_id=node_id,
+                revision_no=next_revision_no,
+                title=str(row["title"]),
+                body=str(row["body"]),
+                comment=f"rollback:{revision_id}",
+            )
+            self._connection.execute(
+                "UPDATE nodes SET current_revision_id = ? WHERE node_id = ?",
+                (next_revision_id, node_id),
+            )
+            self._capture_revision_manifest(node_id=node_id, revision_id=next_revision_id)
+            self._refresh_node_search_index(node_id)
+            self._mark_node_edges_stale_no_transaction(node_id=node_id, timestamp=timestamp)
+        return next_revision_id
 
     def create_tag(self, graph_id: str, name: str) -> str:
         self._require_live_graph(graph_id)
@@ -987,6 +1130,37 @@ class SQLiteMetaStore:
             payload.append(item)
         return payload
 
+    def _mark_node_edges_stale_no_transaction(self, *, node_id: str, timestamp: str) -> int:
+        changed_rows = 0
+        association_cursor = self._connection.execute(
+            """
+            UPDATE edges
+            SET status = 'possibly_stale',
+                updated_at = ?
+            WHERE deleted_at IS NULL
+              AND edge_type = 'association'
+              AND status NOT IN ('rejected', 'possibly_stale')
+              AND (from_node_id = ? OR to_node_id = ?)
+            """,
+            (timestamp, node_id, node_id),
+        )
+        changed_rows += int(association_cursor.rowcount or 0)
+
+        semantic_cursor = self._connection.execute(
+            """
+            UPDATE edges
+            SET status = 'stale',
+                updated_at = ?
+            WHERE deleted_at IS NULL
+              AND edge_type IN ('semantic', 'implication')
+              AND status NOT IN ('rejected', 'stale')
+              AND (from_node_id = ? OR to_node_id = ?)
+            """,
+            (timestamp, node_id, node_id),
+        )
+        changed_rows += int(semantic_cursor.rowcount or 0)
+        return changed_rows
+
     def _initialize_schema(self) -> None:
         self._connection.executescript(
             """
@@ -1027,6 +1201,16 @@ class SQLiteMetaStore:
                 UNIQUE(node_id, revision_no)
             );
             CREATE INDEX IF NOT EXISTS idx_revisions_node_id ON revisions(node_id);
+
+            CREATE TABLE IF NOT EXISTS revision_content_manifest(
+                revision_id TEXT NOT NULL REFERENCES revisions(revision_id) ON DELETE CASCADE,
+                content_item_id TEXT NOT NULL
+                    REFERENCES content_items(content_item_id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                PRIMARY KEY(revision_id, content_item_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_revision_content_manifest_revision
+                ON revision_content_manifest(revision_id, position);
 
             CREATE TABLE IF NOT EXISTS content_items(
                 content_item_id TEXT PRIMARY KEY,
@@ -1092,8 +1276,11 @@ class SQLiteMetaStore:
                 from_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
                 to_node_id TEXT NOT NULL REFERENCES nodes(node_id) ON DELETE CASCADE,
                 edge_type TEXT NOT NULL,
+                subtype TEXT,
                 status TEXT NOT NULL DEFAULT 'pending',
                 weight REAL,
+                provenance_json TEXT NOT NULL DEFAULT '{}',
+                created_by TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 deleted_at TEXT
@@ -1158,6 +1345,7 @@ class SQLiteMetaStore:
             """
         )
         self._ensure_content_item_columns()
+        self._ensure_edge_columns()
         with self._connection:
             self._connection.execute(
                 """
@@ -1185,6 +1373,22 @@ class SQLiteMetaStore:
                 "TEXT NOT NULL DEFAULT '{}'"
             ),
             "extraction_error": "ALTER TABLE content_items ADD COLUMN extraction_error TEXT",
+        }
+        for column_name, statement in required_columns.items():
+            if column_name in existing_columns:
+                continue
+            with self._connection:
+                self._connection.execute(statement)
+
+    def _ensure_edge_columns(self) -> None:
+        rows = self._connection.execute("PRAGMA table_info(edges)").fetchall()
+        existing_columns = {str(row["name"]) for row in rows}
+        required_columns = {
+            "subtype": "ALTER TABLE edges ADD COLUMN subtype TEXT",
+            "provenance_json": (
+                "ALTER TABLE edges ADD COLUMN provenance_json TEXT NOT NULL DEFAULT '{}'"
+            ),
+            "created_by": "ALTER TABLE edges ADD COLUMN created_by TEXT",
         }
         for column_name, statement in required_columns.items():
             if column_name in existing_columns:
@@ -1269,6 +1473,43 @@ class SQLiteMetaStore:
             return 1
         return int(row["max_revision_no"]) + 1
 
+    def _capture_revision_manifest(self, *, node_id: str, revision_id: str) -> None:
+        self._connection.execute(
+            "DELETE FROM revision_content_manifest WHERE revision_id = ?",
+            (revision_id,),
+        )
+        rows = self._connection.execute(
+            """
+            SELECT content_item_id
+            FROM content_items
+            WHERE node_id = ?
+              AND deleted_at IS NULL
+            ORDER BY created_at ASC, content_item_id ASC
+            """,
+            (node_id,),
+        ).fetchall()
+        for position, row in enumerate(rows):
+            self._connection.execute(
+                """
+                INSERT INTO revision_content_manifest(revision_id, content_item_id, position)
+                VALUES (?, ?, ?)
+                """,
+                (revision_id, str(row["content_item_id"]), position),
+            )
+
+    def _require_revision(self, *, node_id: str, revision_id: str) -> Mapping[str, Any]:
+        row = self._connection.execute(
+            """
+            SELECT revision_id, node_id, revision_no, title, body, created_at, comment
+            FROM revisions
+            WHERE node_id = ? AND revision_id = ?
+            """,
+            (node_id, revision_id),
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"Revision not found: {revision_id}")
+        return _row_to_dict(row)
+
     def _require_live_graph(self, graph_id: str) -> None:
         graph = self.get_graph(graph_id)
         if graph is None:
@@ -1318,6 +1559,32 @@ def _content_item_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
             parsed_metadata = {}
     payload["extracted_metadata"] = parsed_metadata
     return payload
+
+
+def _edge_row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
+    payload = _row_to_dict(row)
+    payload["provenance"] = _as_json_mapping(payload.get("provenance_json"))
+    payload.pop("provenance_json", None)
+    return payload
+
+
+def _as_json_mapping(raw: Any) -> dict[str, Any]:
+    if isinstance(raw, dict):
+        return {str(key): value for key, value in raw.items()}
+    if isinstance(raw, str) and raw.strip():
+        try:
+            loaded = json.loads(raw)
+        except json.JSONDecodeError:
+            return {}
+        if isinstance(loaded, dict):
+            return {str(key): value for key, value in loaded.items()}
+    return {}
+
+
+def _serialize_json_object(payload: Mapping[str, Any] | None) -> str:
+    if payload is None:
+        return "{}"
+    return json.dumps(dict(payload), ensure_ascii=False, sort_keys=True, separators=(",", ":"))
 
 
 def _coerce_vector(raw: Any) -> list[float]:

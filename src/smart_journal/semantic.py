@@ -16,6 +16,13 @@ class SemanticSuggestion:
 
 
 @dataclass(frozen=True, slots=True)
+class SemanticRecomputeResult:
+    suggestions: tuple[SemanticSuggestion, ...]
+    stale_edge_ids: tuple[str, ...]
+    stale_edge_count: int
+
+
+@dataclass(frozen=True, slots=True)
 class _CandidateScore:
     weight: float
     supporting_chunk_hits: int
@@ -143,6 +150,47 @@ class SemanticLinker:
             )
         return suggestions
 
+    def recompute_for_node(
+        self,
+        node_id: str,
+        *,
+        top_k_per_chunk: int = 10,
+        max_suggestions: int = 10,
+    ) -> SemanticRecomputeResult:
+        source_node = self._meta_store.get_node(node_id)
+        if source_node is None:
+            raise KeyError(f"Node not found or deleted: {node_id}")
+        graph_id = str(source_node["graph_id"])
+
+        existing_edges = self._existing_semantic_edges(graph_id=graph_id, node_id=node_id)
+        suggestions = self.suggest_for_node(
+            node_id=node_id,
+            top_k_per_chunk=top_k_per_chunk,
+            max_suggestions=max_suggestions,
+        )
+        live_targets = {
+            self._counterpart_node_id(node_id=node_id, edge=item)
+            for item in suggestions
+        }
+        stale_edge_ids: list[str] = []
+        for target_node_id, edge in existing_edges.items():
+            if edge.status == "rejected":
+                continue
+            if target_node_id in live_targets:
+                continue
+            row = self._meta_store.get_edge(edge.edge_id)
+            if row is None:
+                continue
+            if str(row["status"]) != "stale":
+                self._meta_store.update_edge(edge.edge_id, status="stale")
+            stale_edge_ids.append(edge.edge_id)
+
+        return SemanticRecomputeResult(
+            suggestions=tuple(suggestions),
+            stale_edge_ids=tuple(sorted(set(stale_edge_ids))),
+            stale_edge_count=len(set(stale_edge_ids)),
+        )
+
     def _source_chunk_embeddings(self, node_id: str) -> list[tuple[str, list[float]]]:
         payload: list[tuple[str, list[float]]] = []
         for content_item in self._meta_store.list_content_items(node_id):
@@ -185,3 +233,8 @@ class SemanticLinker:
                 to_node_id=to_node_id,
             )
         return payload
+
+    def _counterpart_node_id(self, *, node_id: str, edge: SemanticSuggestion) -> str:
+        if edge.from_node_id == node_id:
+            return edge.to_node_id
+        return edge.from_node_id
